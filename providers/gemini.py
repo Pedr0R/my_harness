@@ -80,10 +80,16 @@ class GeminiProvider:
 
         cost = self._calculate_cost(response.usage_metadata)
 
+        # Captura o Content original para preservar thought_signature em turnos subsequentes com ferramentas
+        raw_content = None
+        if response.candidates and response.candidates[0].content:
+            raw_content = response.candidates[0].content
+
         return ModelResponse(
             content=content_text,
             tool_calls=tool_calls,
             cost=cost,
+            raw_content=raw_content,
         )
 
     def _convert_messages(
@@ -108,6 +114,12 @@ class GeminiProvider:
                 )
 
             elif role == "assistant":
+                # Preserva o Content original com thought_signature intacto se disponível
+                raw_c = msg.get("raw_content")
+                if raw_c is not None and isinstance(raw_c, types.Content):
+                    contents.append(raw_c)
+                    continue
+
                 parts: list[types.Part] = []
                 if msg.get("content"):
                     parts.append(types.Part.from_text(text=str(msg["content"])))

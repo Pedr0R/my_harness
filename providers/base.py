@@ -25,6 +25,7 @@ class ModelResponse:
     tool_calls: list[ToolCall] = field(default_factory=list)
     cost: float = 0.0
     role: str = "assistant"
+    raw_content: Any = None  # Preserva o objeto de conteúdo nativo (ex: thought_signature do Gemini)
 
     def __getitem__(self, item: str) -> Any:
         return getattr(self, item)
@@ -34,7 +35,7 @@ class ModelResponse:
 
     def to_dict(self) -> dict[str, Any]:
         """Converte a resposta para o formato de dicionário compatível com o histórico."""
-        return {
+        d: dict[str, Any] = {
             "role": self.role,
             "content": self.content,
             "tool_calls": [
@@ -43,6 +44,9 @@ class ModelResponse:
             ],
             "cost": self.cost,
         }
+        if self.raw_content is not None:
+            d["raw_content"] = self.raw_content
+        return d
 
 
 @runtime_checkable
