@@ -45,4 +45,5 @@ Keep implementation details out of the map. Name only user paths, stable handles
 - [Agent file tools](./file-tools.md) covers creating, reading, and editing workspace files through live chat prompts and verifying disk side effects.
 - [Agent shell tool](./bash-tool.md) covers executing shell commands from live chat prompts and verifying both terminal output and workspace side effects.
 - [Guardrails](./guardrails.md) covers path sandboxing, destructive shell command blocking, tool-output secrets redaction, loop detection, and per-guardrail configuration toggles.
+- [Workspace checkpointing and rollback](./workspace-checkpoint.md) covers automatic pre-turn Git workspace snapshots, automatic rollback on unhandled turn failure, manual `/undo` and `/rollback`, `--no-checkpoint`, and `.sessions/` preservation.
 - [Provider switching and fallback](./provider-fallback.md) covers selecting providers via `get_provider` and resilient HTTP failover via `FallbackProvider`.

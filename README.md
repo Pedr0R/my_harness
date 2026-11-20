@@ -16,6 +16,7 @@ Um harness leve e modular para agentes autônomos de software (SWE Agents) em Py
 - **Chat Interativo no Terminal**: Conversação contínua com histórico e memória em array/dicionário.
 - **Persistência de Sessões**: Salvamento automático após cada turno em `.sessions/<session_id>.json` e retomada via CLI (`--session`) ou comando `/load`.
 - **Guardrails de Segurança**: Sandboxing de caminhos (`read_file`/`write_file`/`search_replace`/`grep`/`list_dir`/`find_files`), bloqueio de comandos destrutivos no `bash`, redação automática de segredos (`[REDACTED]`) e detecção de loops de ferramentas.
+- **Checkpoint de Workspace e Rollback Automático**: Snapshots isolados via Git (`GIT_INDEX_FILE` temporário, sem poluir `git stash` ou `.git/index`), rollback automático em caso de falha/interrupção no meio do turno e comando manual `/undo` (ou `/rollback`), preservando `.sessions/` e alterações prévias do usuário.
 - **Compactação de Contexto**: Redução automática de mensagens para evitar estourar a janela de contexto.
 
 ---
@@ -28,6 +29,7 @@ my_harness/
 ├── .sessions/          # Histórico persistido de sessões em JSON (ignorado no Git)
 ├── main.py             # Chat interativo no terminal
 ├── agent.py            # Loop de execução, memória e ferramentas do agente
+├── workspace.py        # Checkpoint e rollback automático de workspace via Git
 ├── pyproject.toml      # Configuração do pytest e do linter ruff
 ├── guardrails/         # Validação, sandboxing, redação de segredos e detecção de loop
 ├── tests/              # Suíte de testes unitários (pytest / unittest)
@@ -78,6 +80,7 @@ Opcionalmente, você pode informar outro diretório de sessões com `--sessions-
 ```bash
 python main.py --disable-guardrail loop_detection
 python main.py --disable-guardrail all
+python main.py --no-checkpoint
 ```
 
 Também é possível controlar cada guardrail via variáveis de ambiente (`GUARDRAIL_PATH_SANDBOXING`, `GUARDRAIL_COMMAND_SAFETY`, `GUARDRAIL_SECRETS_REDACTION`, `GUARDRAIL_LOOP_DETECTION`) com `true`/`false`.
@@ -105,6 +108,7 @@ O workflow de CI no GitHub Actions (`.github/workflows/ci.yml`) executa automati
 - `memory`: Exibe o histórico de mensagens gravado na memória da sessão atual.
 - `/sessions`: Lista as sessões salvas em `.sessions/`.
 - `/load <session_id|last>`: Carrega uma sessão existente (ou `last` para a mais recente) sem reiniciar o terminal.
+- `/undo` (ou `/rollback`): Desfaz as alterações de arquivos realizadas pelo último turno concluído usando o checkpoint mais recente.
 
 ---
 
