@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field
+from datetime import datetime
 import json
+import os
 import pathlib
 import subprocess
 from typing import Any
@@ -119,6 +121,25 @@ def discover_context(cwd: pathlib.Path = pathlib.Path.cwd()) -> str:
     return "\n".join(parts)
 
 
+def _serialize_message(msg: dict[str, Any]) -> dict[str, Any]:
+    """Converte uma mensagem do histórico do agente para uma estrutura segura para JSON."""
+    serialized: dict[str, Any] = {}
+    for key, value in msg.items():
+        if key == "raw_content":
+            if value is None:
+                continue
+            if hasattr(value, "model_dump"):
+                try:
+                    serialized[key] = value.model_dump(mode="json", exclude_none=True)
+                except Exception:
+                    continue
+            elif isinstance(value, (dict, list, str, int, float, bool)):
+                serialized[key] = value
+            continue
+        serialized[key] = value
+    return serialized
+
+
 # ---- Agente e Loop de Execução -------------------------------------------------
 @dataclass
 class Agent:
@@ -180,6 +201,75 @@ class Agent:
             "estimated_cost": self.cost,
             "messages": list(self.messages),
         }
+
+    def save_to_file(
+        self,
+        path: str | pathlib.Path,
+        metadata: dict[str, Any] | None = None,
+    ) -> pathlib.Path:
+        """Salva atomicamente o estado da sessão e das mensagens do agente em disco (JSON)."""
+        target = pathlib.Path(path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+
+        now_iso = datetime.now().isoformat()
+        meta = dict(metadata) if metadata else {}
+
+        payload: dict[str, Any] = {
+            "session_id": meta.pop("session_id", target.stem),
+            "started_at": meta.pop("started_at", now_iso),
+            "updated_at": meta.pop("updated_at", now_iso),
+            "n_turns": self.n_turns,
+            "cost": self.cost,
+            "messages": [_serialize_message(m) for m in self.messages],
+            "history": meta.pop("history", []),
+        }
+        payload.update(meta)
+
+        tmp_path = target.with_name(f".{target.name}.{os.getpid()}.tmp")
+        try:
+            tmp_path.write_text(
+                json.dumps(payload, indent=2, ensure_ascii=False, default=str),
+                encoding="utf-8",
+            )
+            os.replace(tmp_path, target)
+        finally:
+            if tmp_path.exists():
+                try:
+                    tmp_path.unlink()
+                except OSError:
+                    pass
+
+        return target
+
+    def load_from_file(self, path: str | pathlib.Path) -> dict[str, Any]:
+        """Carrega o estado salvo de um arquivo JSON e restaura messages, n_turns e cost."""
+        source = pathlib.Path(path)
+        if not source.is_file():
+            raise FileNotFoundError(f"Arquivo de sessão não encontrado: {source}")
+
+        try:
+            data = json.loads(source.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"Arquivo de sessão corrompido ou JSON inválido ({source}): {exc}") from exc
+
+        if not isinstance(data, dict):
+            raise ValueError(f"Formato de sessão inválido em {source}: esperado objeto JSON.")
+
+        raw_messages = data.get("messages")
+        if not isinstance(raw_messages, list) or not all(isinstance(m, dict) for m in raw_messages):
+            raise ValueError(f"Campo 'messages' inválido no arquivo de sessão: {source}")
+
+        n_turns = data.get("n_turns", 0)
+        cost = data.get("cost", 0.0)
+        if not isinstance(n_turns, int) or isinstance(n_turns, bool) or n_turns < 0:
+            raise ValueError(f"Campo 'n_turns' inválido no arquivo de sessão: {source}")
+        if not isinstance(cost, (int, float)) or isinstance(cost, bool) or cost < 0:
+            raise ValueError(f"Campo 'cost' inválido no arquivo de sessão: {source}")
+
+        self.messages = [dict(m) for m in raw_messages]
+        self.n_turns = n_turns
+        self.cost = float(cost)
+        return data
 
     async def run(self, task: str) -> str:
         """Executa um turno de raciocínio e ação do agente para atender à tarefa."""

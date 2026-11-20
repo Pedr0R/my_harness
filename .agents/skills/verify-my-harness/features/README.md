@@ -41,6 +41,7 @@ Keep implementation details out of the map. Name only user paths, stable handles
 
 - [Interactive chat session](./chat-session.md) covers REPL launch, multi-turn context retention, blank-input handling, and exit paths (`exit`, `sair`, `quit`, `q`, `EOF`).
 - [Session memory inspection](./session-memory.md) covers the `memory` command before and after live turns, including turn count, estimated cost, and logged history entries.
+- [Session persistence and resumption](./session-persistence.md) covers automatic JSON persistence to `.sessions/<session_id>.json`, resuming via `--session <id>` and `/load <id>`, and listing sessions via `/sessions`.
 - [Agent file tools](./file-tools.md) covers creating, reading, and editing workspace files through live chat prompts and verifying disk side effects.
 - [Agent shell tool](./bash-tool.md) covers executing shell commands from live chat prompts and verifying both terminal output and workspace side effects.
 - [Provider switching and fallback](./provider-fallback.md) covers selecting providers via `get_provider` and resilient HTTP failover via `FallbackProvider`.

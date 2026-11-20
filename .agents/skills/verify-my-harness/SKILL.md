@@ -57,10 +57,13 @@ Always drive through [`scripts/control_harness.py`](./scripts/control_harness.py
 
 - **REPL prompt handle:** The harness synchronizes every turn on the exact stdout prompt `Você: `, sends one UTF-8 line, and waits until the next `Você: ` prompt (or process exit for `exit`/`sair`/`quit`/`q`/`__EOF__`).
 - **Built-in REPL commands:**
-  - `memory` — prints `[Memória da Sessão Atual]:`, `Total de turnos internos:`, `Custo estimado:`, `Total de mensagens gravadas:`, and timestamped `USER:` / `AGENT:` lines.
-  - `exit`, `sair`, `quit`, `q` — prints `Encerrando conversa...` followed by `Sessão finalizada: session_...` and `Interações guardadas na memória: N`.
+  - `memory` — prints `[Memória da Sessão Atual]:`, `Sessão:`, `Total de turnos internos:`, `Custo estimado:`, `Total de mensagens gravadas:`, and timestamped `USER:` / `AGENT:` lines.
+  - `/sessions` — lists saved `.sessions/*.json` sessions (newest first, with interaction and turn counts).
+  - `/load <session_id>` — loads a saved session from `.sessions/` into the running REPL without restarting.
+  - `exit`, `sair`, `quit`, `q` — prints `Encerrando conversa...` followed by `Sessão finalizada: session_...`, `Interações guardadas na memória: N`, and (when saved) `Sessão salva em: <path>`.
   - `__EOF__` (closes stdin) — triggers `EOFError`, prints `Encerrando sessão via interrupção...`, and still prints the `Sessão finalizada:` summary.
   - `""` (empty input) — ignored cleanly; returns directly to `Você: ` without invoking the model.
+- **Forwarding CLI flags to `main.py`:** Pass repeatable `--cli-arg=<arg>` (for example `--cli-arg=--session --cli-arg=<session_id>`) when driving session resumption.
 - **Seeding files in the scratch workspace:** Pass `--seed-file "rel/path.txt=line 1\nline 2"` (repeatable) before driving `file-tools` or `bash-tool`.
 - **Provider fallback over a real HTTP boundary:** Drive `get_provider` + `OpenAICompatibleProvider` + `FallbackProvider` against an ephemeral local HTTP server (`127.0.0.1:0`) where the primary endpoint returns HTTP `429` and the secondary returns HTTP `200`:
 
@@ -106,6 +109,6 @@ After cleanup, confirm the proof files still exist at the reported `evidence_dir
 
 - [`scripts/control_harness.py`](./scripts/control_harness.py) — standalone Python 3 CLI (stdlib + repo imports for `verify-fallback`):
   - `python .agents/skills/verify-my-harness/scripts/control_harness.py doctor [--timeout 30] [--ping]`
-  - `python .agents/skills/verify-my-harness/scripts/control_harness.py drive --feature <id> [--run-id <id>] [--entry-point <label>] [--seed-file RELPATH=CONTENT]... [--input TEXT]... [--startup-timeout 35] [--turn-timeout 60] [--workspace-dir PATH] [--evidence-dir PATH] [--no-auto-exit]`
+  - `python .agents/skills/verify-my-harness/scripts/control_harness.py drive --feature <id> [--run-id <id>] [--entry-point <label>] [--seed-file RELPATH=CONTENT]... [--cli-arg ARG]... [--input TEXT]... [--startup-timeout 35] [--turn-timeout 60] [--workspace-dir PATH] [--evidence-dir PATH] [--no-auto-exit]`
   - `python .agents/skills/verify-my-harness/scripts/control_harness.py verify-fallback [--run-id <id>] [--feature provider-fallback] [--prompt TEXT] [--evidence-dir PATH]`
   - `python .agents/skills/verify-my-harness/scripts/control_harness.py cleanup --run-id <id>`

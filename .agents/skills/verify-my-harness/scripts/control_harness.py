@@ -314,9 +314,10 @@ def run_interactive_session(
     startup_timeout: float,
     turn_timeout: float,
     auto_exit: bool,
+    cli_args: list[str] | None = None,
 ) -> dict[str, Any]:
     env, _ = load_repo_env_without_printing(repo_root)
-    cmd = [sys.executable, "-u", str(repo_root / "main.py")]
+    cmd = [sys.executable, "-u", str(repo_root / "main.py"), *(cli_args or [])]
 
     workspace_dir.mkdir(parents=True, exist_ok=True)
     before_snapshot = snapshot_workspace(workspace_dir)
@@ -610,6 +611,7 @@ def cmd_drive(args: argparse.Namespace) -> int:
         startup_timeout=args.startup_timeout,
         turn_timeout=args.turn_timeout,
         auto_exit=not args.no_auto_exit,
+        cli_args=args.cli_arg or [],
     )
 
     report = {
@@ -910,6 +912,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_drive.add_argument("--evidence-dir", help="Override evidence output directory")
     p_drive.add_argument("--startup-timeout", type=float, default=35.0)
     p_drive.add_argument("--turn-timeout", type=float, default=60.0)
+    p_drive.add_argument(
+        "--cli-arg",
+        action="append",
+        default=[],
+        help="Extra CLI argument forwarded to main.py (repeatable, e.g. --cli-arg=--session --cli-arg=<id>)",
+    )
     p_drive.add_argument(
         "--no-auto-exit",
         action="store_true",
