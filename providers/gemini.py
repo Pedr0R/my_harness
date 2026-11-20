@@ -114,11 +114,18 @@ class GeminiProvider:
                 )
 
             elif role == "assistant":
-                # Preserva o Content original com thought_signature intacto se disponível
+                # Preserva o Content original com thought_signature intacto (em memória ou reidratado do JSON)
                 raw_c = msg.get("raw_content")
-                if raw_c is not None and isinstance(raw_c, types.Content):
-                    contents.append(raw_c)
-                    continue
+                if raw_c is not None:
+                    if isinstance(raw_c, types.Content):
+                        contents.append(raw_c)
+                        continue
+                    if isinstance(raw_c, dict):
+                        try:
+                            contents.append(types.Content.model_validate(raw_c))
+                            continue
+                        except Exception:
+                            pass
 
                 parts: list[types.Part] = []
                 if msg.get("content"):

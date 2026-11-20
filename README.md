@@ -11,6 +11,7 @@ Um harness leve e modular para agentes autônomos de software (SWE Agents) em Py
   - `write_file`: Criação e sobrescrita de arquivos.
   - `search_replace`: Substituição precisa de textos em arquivos.
 - **Chat Interativo no Terminal**: Conversação contínua com histórico e memória em array/dicionário.
+- **Persistência de Sessões**: Salvamento automático após cada turno em `.sessions/<session_id>.json` e retomada via CLI (`--session`) ou comando `/load`.
 - **Compactação de Contexto**: Redução automática de mensagens para evitar estourar a janela de contexto.
 
 ---
@@ -20,6 +21,7 @@ Um harness leve e modular para agentes autônomos de software (SWE Agents) em Py
 ```text
 my_harness/
 ├── .env                # Chaves de API e configurações de ambiente
+├── .sessions/          # Histórico persistido de sessões em JSON (ignorado no Git)
 ├── main.py             # Chat interativo no terminal
 ├── agent.py            # Loop de execução, memória e ferramentas do agente
 └── providers/          # Camada desacoplada de modelos
@@ -57,9 +59,20 @@ Execute o chat interativo no terminal:
 python main.py
 ```
 
+Para retomar uma sessão salva anteriormente em `.sessions/` (ou usar `last` para a mais recente):
+
+```bash
+python main.py --session session_20261119_220000
+python main.py --session last
+```
+
+Opcionalmente, você pode informar outro diretório de sessões com `--sessions-dir <caminho>`.
+
 ### Comandos no Terminal:
-- `exit` ou `sair`: Encerra a conversa e exibe o resumo da sessão.
+- `exit` ou `sair` (também `quit` ou `q`): Encerra a conversa e exibe o resumo da sessão.
 - `memory`: Exibe o histórico de mensagens gravado na memória da sessão atual.
+- `/sessions`: Lista as sessões salvas em `.sessions/`.
+- `/load <session_id|last>`: Carrega uma sessão existente (ou `last` para a mais recente) sem reiniciar o terminal.
 
 ---
 
