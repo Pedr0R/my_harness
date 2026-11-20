@@ -8,11 +8,19 @@ import sys
 from typing import Any
 
 from agent import Agent
+from guardrails import GuardrailsConfig, build_guardrails
 from providers import get_provider
 
 
 DEFAULT_SESSIONS_DIR = ".sessions"
 SESSION_ID_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+GUARDRAIL_CHOICES = (
+    "path_sandboxing",
+    "command_safety",
+    "secrets_redaction",
+    "loop_detection",
+    "all",
+)
 
 
 def validate_session_id(raw_id: str) -> str:
@@ -127,6 +135,21 @@ def _restore_session_data(data: dict[str, Any], fallback_id: str) -> dict[str, A
     }
 
 
+def build_guardrails_config(disabled_guardrails: list[str] | None = None) -> GuardrailsConfig:
+    config = GuardrailsConfig.from_env()
+    disabled = set(disabled_guardrails or [])
+    if "all" in disabled:
+        config.path_sandboxing = False
+        config.command_safety = False
+        config.secrets_redaction = False
+        config.loop_detection = False
+    else:
+        for name in disabled:
+            if hasattr(config, name):
+                setattr(config, name, False)
+    return config
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Chat interativo no terminal com SWE-Agent.")
     parser.add_argument(
@@ -141,25 +164,33 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=DEFAULT_SESSIONS_DIR,
         help=f"Diretório de armazenamento das sessões (padrão: {DEFAULT_SESSIONS_DIR}).",
     )
+    parser.add_argument(
+        "--disable-guardrail",
+        action="append",
+        choices=GUARDRAIL_CHOICES,
+        default=[],
+        help="Desabilita um guardrail específico (pode ser repetido; use 'all' para desabilitar todos).",
+    )
     return parser.parse_args(argv)
 
 
 async def terminal_chat(
     session_id: str | None = None,
     sessions_dir: str | pathlib.Path = DEFAULT_SESSIONS_DIR,
+    disabled_guardrails: list[str] | None = None,
 ) -> dict[str, Any]:
-    # 1. Configura o provedor e instancia o Agente
     provider = get_provider("gemini", model="gemini-3.5-flash-lite")
+    guardrails_config = build_guardrails_config(disabled_guardrails)
     agent = Agent(
         name="SWE-Agent",
         model=provider,
         instructions="Você é um assistente de engenharia de software conciso e prestativo. Mantenha o contexto das mensagens anteriores.",
+        guardrails=build_guardrails(guardrails_config),
     )
 
     sessions_path = pathlib.Path(sessions_dir)
     resumed = False
 
-    # 2. Carrega sessão existente (--session <id|last>) ou inicia uma nova estrutura de sessão
     if session_id is not None:
         try:
             validated_id, current_file = resolve_session_target(sessions_path, session_id)
@@ -349,5 +380,6 @@ if __name__ == "__main__":
         terminal_chat(
             session_id=cli_args.session_id,
             sessions_dir=cli_args.sessions_dir,
+            disabled_guardrails=cli_args.disable_guardrail,
         )
     )
