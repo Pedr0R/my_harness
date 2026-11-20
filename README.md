@@ -11,9 +11,11 @@ Um harness leve e modular para agentes autônomos de software (SWE Agents) em Py
   - `write_file`: Criação e sobrescrita de arquivos.
   - `search_replace`: Substituição precisa de textos em arquivos.
   - `grep`: Busca de texto literal ou regex em arquivos e diretórios com filtro glob e limite de resultados.
+  - `list_dir`: Listagem hierárquica de diretórios e arquivos com profundidade configurável (`max_depth`).
+  - `find_files`: Busca recursiva de arquivos por padrão glob de nome ou caminho relativo.
 - **Chat Interativo no Terminal**: Conversação contínua com histórico e memória em array/dicionário.
 - **Persistência de Sessões**: Salvamento automático após cada turno em `.sessions/<session_id>.json` e retomada via CLI (`--session`) ou comando `/load`.
-- **Guardrails de Segurança**: Sandboxing de caminhos (`read_file`/`write_file`/`search_replace`/`grep`), bloqueio de comandos destrutivos no `bash`, redação automática de segredos (`[REDACTED]`) e detecção de loops de ferramentas.
+- **Guardrails de Segurança**: Sandboxing de caminhos (`read_file`/`write_file`/`search_replace`/`grep`/`list_dir`/`find_files`), bloqueio de comandos destrutivos no `bash`, redação automática de segredos (`[REDACTED]`) e detecção de loops de ferramentas.
 - **Compactação de Contexto**: Redução automática de mensagens para evitar estourar a janela de contexto.
 
 ---

@@ -16,7 +16,7 @@ from guardrails.path_sandbox import is_sensitive_path
 from providers import ModelProvider, get_provider
 
 
-# ---- Ferramentas: bash + 4 ferramentas de arquivos ----------------------------
+# ---- Ferramentas: bash + ferramentas de arquivos e exploração ------------------
 def _truncate(s: str, n: int = 25_000) -> str:
     """Trunca strings longas para não sobrecarregar o contexto."""
     return s if len(s) <= n else s[:n] + "\n[truncado]"
@@ -66,6 +66,40 @@ def _is_link_or_junction(path: str) -> bool:
         except OSError:
             return False
     return os.path.islink(path)
+
+
+def _resolve_safe_walk_entry(
+    entry_str: str,
+    entry_path: pathlib.Path,
+    search_root: pathlib.Path,
+) -> pathlib.Path | None:
+    resolved = entry_path
+    if _is_link_or_junction(entry_str):
+        try:
+            resolved = entry_path.resolve()
+        except OSError:
+            return None
+    if is_sensitive_path(resolved, search_root) is not None:
+        return None
+    return resolved
+
+
+def _filter_walk_dirs(
+    dirpath: str,
+    current_dir: pathlib.Path,
+    dirnames: list[str],
+    search_root: pathlib.Path,
+) -> list[str]:
+    kept: list[str] = []
+    for d in sorted(dirnames):
+        if d in IGNORED_DIRS:
+            continue
+        dir_str = os.path.join(dirpath, d)
+        resolved = _resolve_safe_walk_entry(dir_str, current_dir / d, search_root)
+        if resolved is None or resolved.name in IGNORED_DIRS:
+            continue
+        kept.append(d)
+    return kept
 
 
 def _grep_file(
@@ -134,36 +168,17 @@ def tool_grep(
             rel_dir_parts = current_dir.relative_to(search_root).parts
             rel_prefix = "/".join(rel_dir_parts) + "/" if rel_dir_parts else ""
 
-            kept_dirs: list[str] = []
-            for d in sorted(dirnames):
-                if d in IGNORED_DIRS:
-                    continue
-                dir_str = os.path.join(dirpath, d)
-                dir_path = current_dir / d
-                if _is_link_or_junction(dir_str):
-                    try:
-                        dir_path = dir_path.resolve()
-                    except OSError:
-                        continue
-                if is_sensitive_path(dir_path, search_root) is not None:
-                    continue
-                kept_dirs.append(d)
-            dirnames[:] = kept_dirs
+            dirnames[:] = _filter_walk_dirs(dirpath, current_dir, dirnames, search_root)
 
             for filename in sorted(filenames):
                 if file_pattern != "*" and not fnmatch.fnmatch(filename, file_pattern):
                     continue
                 file_str = os.path.join(dirpath, filename)
-                file_path = current_dir / filename
-                if _is_link_or_junction(file_str):
-                    try:
-                        file_path = file_path.resolve()
-                    except OSError:
-                        continue
-                if is_sensitive_path(file_path, search_root) is not None:
+                resolved_file = _resolve_safe_walk_entry(file_str, current_dir / filename, search_root)
+                if resolved_file is None:
                     continue
                 rel_path = f"{rel_prefix}{filename}"
-                if _grep_file(file_path, rel_path, pattern, compiled, matches, max_results):
+                if _grep_file(resolved_file, rel_path, pattern, compiled, matches, max_results):
                     truncated = True
                     break
             if truncated:
@@ -178,12 +193,103 @@ def tool_grep(
     return _truncate(output)
 
 
+def tool_list_dir(path: str = ".", max_depth: int = 1) -> str:
+    """Lista arquivos e subdiretórios de forma hierárquica até max_depth níveis."""
+    if max_depth <= 0:
+        return "ERRO: max_depth deve ser maior que zero"
+
+    target = pathlib.Path(path)
+    if not target.exists():
+        return f"ERRO: caminho não encontrado: {path}"
+    if not target.is_dir():
+        return f"ERRO: o caminho não é um diretório: {path}"
+
+    search_root = target.resolve()
+    lines: list[str] = []
+
+    def _walk_level(current_dir: pathlib.Path, depth: int) -> None:
+        try:
+            with os.scandir(current_dir) as it:
+                entries = sorted(it, key=lambda e: e.name)
+        except OSError:
+            return
+
+        indent = "  " * depth
+        for entry in entries:
+            if entry.name in IGNORED_DIRS:
+                try:
+                    if entry.is_dir(follow_symlinks=False):
+                        continue
+                except OSError:
+                    continue
+            resolved = _resolve_safe_walk_entry(entry.path, current_dir / entry.name, search_root)
+            if resolved is None:
+                continue
+            try:
+                is_dir = resolved.is_dir()
+            except OSError:
+                continue
+            if is_dir and (entry.name in IGNORED_DIRS or resolved.name in IGNORED_DIRS):
+                continue
+            lines.append(f"{indent}{entry.name}/" if is_dir else f"{indent}{entry.name}")
+            if is_dir and depth + 1 < max_depth:
+                _walk_level(resolved, depth + 1)
+
+    _walk_level(search_root, 0)
+
+    if not lines:
+        return "Diretório vazio."
+    return _truncate("\n".join(lines))
+
+
+def tool_find_files(pattern: str = "*", path: str = ".") -> str:
+    """Busca arquivos recursivamente em um diretório usando padrão glob."""
+    if not pattern or not pattern.strip():
+        return "ERRO: padrão de busca não pode ser vazio"
+
+    target = pathlib.Path(path)
+    if not target.exists():
+        return f"ERRO: caminho não encontrado: {path}"
+    if not target.is_dir():
+        return f"ERRO: o caminho não é um diretório: {path}"
+
+    normalized_pattern = pattern.replace("\\", "/")
+    match_rel_path = "/" in normalized_pattern
+    search_root = target.resolve()
+    matches: list[str] = []
+
+    for dirpath, dirnames, filenames in os.walk(search_root):
+        current_dir = pathlib.Path(dirpath)
+        rel_dir_parts = current_dir.relative_to(search_root).parts
+        rel_prefix = "/".join(rel_dir_parts) + "/" if rel_dir_parts else ""
+
+        dirnames[:] = _filter_walk_dirs(dirpath, current_dir, dirnames, search_root)
+
+        for filename in filenames:
+            rel_path = f"{rel_prefix}{filename}"
+            candidate = rel_path if match_rel_path else filename
+            if not fnmatch.fnmatch(candidate, normalized_pattern):
+                continue
+            file_str = os.path.join(dirpath, filename)
+            if _resolve_safe_walk_entry(file_str, current_dir / filename, search_root) is None:
+                continue
+            matches.append(rel_path)
+
+    if not matches:
+        return "Nenhum arquivo encontrado."
+
+    matches.sort()
+    return _truncate("\n".join(matches))
+
+
 TOOLS = {
     "bash": tool_bash,
     "read_file": tool_read_file,
     "write_file": tool_write_file,
     "search_replace": tool_search_replace,
     "grep": tool_grep,
+    "list_dir": tool_list_dir,
+    "find_files": tool_find_files,
 }
 
 TOOL_SCHEMAS = [
@@ -272,6 +378,51 @@ TOOL_SCHEMAS = [
                 },
             },
             "required": ["pattern"],
+        },
+    },
+    {
+        "name": "list_dir",
+        "description": (
+            "Lista arquivos e subdiretórios de um diretório de forma hierárquica "
+            "até a profundidade máxima especificada."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Diretório alvo a ser listado. Padrão é '.'.",
+                },
+                "max_depth": {
+                    "type": "integer",
+                    "description": "Profundidade máxima de listagem (1 = filhos imediatos). Padrão é 1.",
+                },
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "find_files",
+        "description": (
+            "Busca arquivos recursivamente em um diretório usando padrão glob "
+            "(ex.: '*.py' ou 'pkg/*.py')."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "pattern": {
+                    "type": "string",
+                    "description": (
+                        "Padrão glob para filtrar nomes ou caminhos relativos de arquivos "
+                        "(ex.: '*.py', 'pkg/*.py'). Padrão é '*'."
+                    ),
+                },
+                "path": {
+                    "type": "string",
+                    "description": "Diretório base da busca. Padrão é '.'.",
+                },
+            },
+            "required": [],
         },
     },
 ]

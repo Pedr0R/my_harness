@@ -10,7 +10,7 @@ import unittest
 from typing import Any
 from unittest import mock
 
-from agent import Agent, tool_grep
+from agent import Agent, tool_find_files, tool_grep, tool_list_dir
 from guardrails import (
     BaseGuardrail,
     CommandSafetyGuardrail,
@@ -225,6 +225,85 @@ class TestPathSandboxingGuardrail(unittest.TestCase):
         self.assertNotIn("SHARED_TOKEN_ENV", out)
         if link_created is not None:
             self.assertNotIn("SHARED_TOKEN_OUTSIDE", out)
+
+    def test_exploration_tools_allow_omitted_path_and_valid_workspace_paths(self) -> None:
+        for tool_name, base_args in (
+            ("list_dir", {}),
+            ("list_dir", {"max_depth": 2}),
+            ("find_files", {}),
+            ("find_files", {"pattern": "*.py"}),
+        ):
+            result = self.guardrail.check_tool_call(tool_name, base_args)
+            self.assertTrue(result.allowed, f"{tool_name} should allow omitted path: {result.reason}")
+
+        for tool_name in ("list_dir", "find_files"):
+            for valid_path in (".", "src", str(self.root / "nested")):
+                result = self.guardrail.check_tool_call(tool_name, {"path": valid_path})
+                self.assertTrue(
+                    result.allowed,
+                    f"{tool_name} should allow {valid_path}: {result.reason}",
+                )
+
+    def test_exploration_tools_block_outside_sensitive_empty_and_escaping_symlink(self) -> None:
+        blocked_paths: list[Any] = [
+            "..",
+            "../outside",
+            str(self.outside),
+            str(self.outside / "secret.txt"),
+            ".env",
+            ".env.local",
+            ".git",
+            ".git/config",
+            "",
+            "   ",
+            None,
+            123,
+        ]
+        for tool_name in ("list_dir", "find_files"):
+            for path in blocked_paths:
+                result = self.guardrail.check_tool_call(tool_name, {"path": path})
+                self.assertFalse(result.allowed, f"{tool_name} should block path={path!r}")
+                self.assertTrue(result.reason)
+
+        outside_file = self.outside / "explore_escape.txt"
+        outside_file.write_text("SECRET_OUTSIDE", encoding="utf-8")
+        target_arg = self._create_escaping_link(
+            outside_file, "explore_escape_link.txt", "explore_escape_dir"
+        )
+        if target_arg is None:
+            self.skipTest("OS does not allow creating symlinks or junctions in test env")
+
+        for tool_name in ("list_dir", "find_files"):
+            result = self.guardrail.check_tool_call(tool_name, {"path": target_arg})
+            self.assertFalse(result.allowed, f"{tool_name} should block escaping link {target_arg}")
+            self.assertTrue(result.reason)
+
+    def test_tool_list_dir_and_find_files_walk_skip_env_and_escaping_symlink(self) -> None:
+        (self.root / "safe.txt").write_text("ok\n", encoding="utf-8")
+        (self.root / ".env").write_text("API_KEY=secret\n", encoding="utf-8")
+        outside_file = self.outside / "leaked.txt"
+        outside_file.write_text("outside\n", encoding="utf-8")
+        link_created = self._create_escaping_link(
+            outside_file, "explore_walk_escape.txt", "explore_walk_escape_dir"
+        )
+
+        prev_cwd = pathlib.Path.cwd()
+        try:
+            os.chdir(self.root)
+            listed = tool_list_dir(path=".", max_depth=2)
+            found = tool_find_files(pattern="*", path=".")
+        finally:
+            os.chdir(prev_cwd)
+
+        self.assertEqual(listed, "safe.txt")
+        self.assertEqual(found, "safe.txt")
+        self.assertNotIn(".env", listed)
+        self.assertNotIn(".env", found)
+        if link_created is not None:
+            self.assertNotIn("leaked.txt", listed)
+            self.assertNotIn("leaked.txt", found)
+            self.assertNotIn("explore_walk_escape", listed)
+            self.assertNotIn("explore_walk_escape", found)
 
 
 class TestCommandSafetyGuardrail(unittest.TestCase):

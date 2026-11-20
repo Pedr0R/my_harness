@@ -6,9 +6,11 @@ from typing import Any, Callable
 from guardrails.base import BaseGuardrail, GuardrailResult
 
 
-FILE_TOOLS: frozenset[str] = frozenset({"read_file", "write_file", "search_replace", "grep"})
+FILE_TOOLS: frozenset[str] = frozenset(
+    {"read_file", "write_file", "search_replace", "grep", "list_dir", "find_files"}
+)
 
-DEFAULT_PATH_TOOLS: frozenset[str] = frozenset({"grep"})
+DEFAULT_PATH_TOOLS: frozenset[str] = frozenset({"grep", "list_dir", "find_files"})
 
 SENSITIVE_DIRS: frozenset[str] = frozenset({".git", ".ssh", ".gnupg", ".aws"})
 
