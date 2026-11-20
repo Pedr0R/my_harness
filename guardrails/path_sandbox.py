@@ -6,7 +6,9 @@ from typing import Any, Callable
 from guardrails.base import BaseGuardrail, GuardrailResult
 
 
-FILE_TOOLS: frozenset[str] = frozenset({"read_file", "write_file", "search_replace"})
+FILE_TOOLS: frozenset[str] = frozenset({"read_file", "write_file", "search_replace", "grep"})
+
+DEFAULT_PATH_TOOLS: frozenset[str] = frozenset({"grep"})
 
 SENSITIVE_DIRS: frozenset[str] = frozenset({".git", ".ssh", ".gnupg", ".aws"})
 
@@ -42,6 +44,24 @@ SENSITIVE_PATH_CHECKS: tuple[Callable[[tuple[str, ...], str, str], str | None], 
 )
 
 
+def is_sensitive_path(resolved: pathlib.Path, root: pathlib.Path) -> str | None:
+    try:
+        rel = resolved.relative_to(root)
+    except ValueError:
+        return "Blocked by path sandbox (outside workspace)."
+
+    lower_parts = tuple(part.lower() for part in rel.parts)
+    lower_name = rel.name.lower()
+    lower_suffix = rel.suffix.lower()
+
+    for check in SENSITIVE_PATH_CHECKS:
+        reason = check(lower_parts, lower_name, lower_suffix)
+        if reason is not None:
+            return reason
+
+    return None
+
+
 class PathSandboxingGuardrail(BaseGuardrail):
     name = "path_sandboxing"
 
@@ -59,7 +79,11 @@ class PathSandboxingGuardrail(BaseGuardrail):
         if not self.enabled or tool_name not in FILE_TOOLS:
             return GuardrailResult(allowed=True)
 
-        raw_path = args.get("path")
+        if "path" not in args and tool_name in DEFAULT_PATH_TOOLS:
+            raw_path: Any = "."
+        else:
+            raw_path = args.get("path")
+
         if not isinstance(raw_path, str) or not raw_path.strip():
             return GuardrailResult(
                 allowed=False,
@@ -75,20 +99,8 @@ class PathSandboxingGuardrail(BaseGuardrail):
                 reason="Blocked by path sandbox (invalid path).",
             )
 
-        if not resolved.is_relative_to(root):
-            return GuardrailResult(
-                allowed=False,
-                reason="Blocked by path sandbox (outside workspace).",
-            )
-
-        rel = resolved.relative_to(root)
-        lower_parts = tuple(part.lower() for part in rel.parts)
-        lower_name = resolved.name.lower()
-        lower_suffix = resolved.suffix.lower()
-
-        for check in SENSITIVE_PATH_CHECKS:
-            reason = check(lower_parts, lower_name, lower_suffix)
-            if reason is not None:
-                return GuardrailResult(allowed=False, reason=reason)
+        reason = is_sensitive_path(resolved, root)
+        if reason is not None:
+            return GuardrailResult(allowed=False, reason=reason)
 
         return GuardrailResult(allowed=True)

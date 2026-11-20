@@ -2,17 +2,21 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime
+import fnmatch
 import json
 import os
 import pathlib
+import re
+import stat
 import subprocess
 from typing import Any
 
 from guardrails import BaseGuardrail
+from guardrails.path_sandbox import is_sensitive_path
 from providers import ModelProvider, get_provider
 
 
-# ---- Ferramentas: bash + 3 ferramentas de arquivos ----------------------------
+# ---- Ferramentas: bash + 4 ferramentas de arquivos ----------------------------
 def _truncate(s: str, n: int = 25_000) -> str:
     """Trunca strings longas para não sobrecarregar o contexto."""
     return s if len(s) <= n else s[:n] + "\n[truncado]"
@@ -50,11 +54,136 @@ def tool_search_replace(path: str, search: str, replace: str) -> str:
     return "OK"
 
 
+IGNORED_DIRS: frozenset[str] = frozenset(
+    {".git", "__pycache__", ".venv", "venv", "node_modules", ".pytest_cache", ".ruff_cache", ".sessions"}
+)
+
+
+def _is_link_or_junction(path: str) -> bool:
+    if os.name == "nt":
+        try:
+            return bool(os.lstat(path).st_file_attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT)
+        except OSError:
+            return False
+    return os.path.islink(path)
+
+
+def _grep_file(
+    file_path: pathlib.Path | str,
+    display_path: str,
+    pattern: str,
+    compiled: re.Pattern[str] | None,
+    matches: list[str],
+    max_results: int,
+) -> bool:
+    try:
+        with open(file_path, "rb") as fh:
+            head = fh.read(8192)
+            if b"\x00" in head:
+                return False
+            raw = head if len(head) < 8192 else head + fh.read()
+    except OSError:
+        return False
+
+    text = raw.decode("utf-8", errors="replace")
+    if compiled is None and pattern not in text:
+        return False
+
+    for line_no, line in enumerate(text.splitlines(), start=1):
+        matched = compiled.search(line) is not None if compiled is not None else pattern in line
+        if matched:
+            if len(matches) >= max_results:
+                return True
+            matches.append(f"{display_path}:{line_no}: {line}")
+    return False
+
+
+def tool_grep(
+    pattern: str,
+    path: str = ".",
+    regex: bool = False,
+    file_pattern: str = "*",
+    max_results: int = 50,
+) -> str:
+    """Busca texto literal ou regex em um arquivo ou recursivamente em um diretório."""
+    if not pattern:
+        return "ERRO: padrão de busca não pode ser vazio"
+    if max_results <= 0:
+        return "ERRO: max_results deve ser maior que zero"
+
+    compiled: re.Pattern[str] | None = None
+    if regex:
+        try:
+            compiled = re.compile(pattern)
+        except re.error as exc:
+            return f"ERRO: expressão regular inválida: {exc}"
+
+    target = pathlib.Path(path)
+    if not target.exists():
+        return f"ERRO: caminho não encontrado: {path}"
+
+    matches: list[str] = []
+    truncated = False
+
+    if target.is_file():
+        truncated = _grep_file(target, target.as_posix(), pattern, compiled, matches, max_results)
+    elif target.is_dir():
+        search_root = target.resolve()
+        for dirpath, dirnames, filenames in os.walk(search_root):
+            current_dir = pathlib.Path(dirpath)
+            rel_dir_parts = current_dir.relative_to(search_root).parts
+            rel_prefix = "/".join(rel_dir_parts) + "/" if rel_dir_parts else ""
+
+            kept_dirs: list[str] = []
+            for d in sorted(dirnames):
+                if d in IGNORED_DIRS:
+                    continue
+                dir_str = os.path.join(dirpath, d)
+                dir_path = current_dir / d
+                if _is_link_or_junction(dir_str):
+                    try:
+                        dir_path = dir_path.resolve()
+                    except OSError:
+                        continue
+                if is_sensitive_path(dir_path, search_root) is not None:
+                    continue
+                kept_dirs.append(d)
+            dirnames[:] = kept_dirs
+
+            for filename in sorted(filenames):
+                if file_pattern != "*" and not fnmatch.fnmatch(filename, file_pattern):
+                    continue
+                file_str = os.path.join(dirpath, filename)
+                file_path = current_dir / filename
+                if _is_link_or_junction(file_str):
+                    try:
+                        file_path = file_path.resolve()
+                    except OSError:
+                        continue
+                if is_sensitive_path(file_path, search_root) is not None:
+                    continue
+                rel_path = f"{rel_prefix}{filename}"
+                if _grep_file(file_path, rel_path, pattern, compiled, matches, max_results):
+                    truncated = True
+                    break
+            if truncated:
+                break
+
+    if not matches:
+        return "Nenhuma ocorrência encontrada."
+
+    output = "\n".join(matches)
+    if truncated:
+        output += f"\n[limite de {max_results} resultados atingido]"
+    return _truncate(output)
+
+
 TOOLS = {
     "bash": tool_bash,
     "read_file": tool_read_file,
     "write_file": tool_write_file,
     "search_replace": tool_search_replace,
+    "grep": tool_grep,
 }
 
 TOOL_SCHEMAS = [
@@ -111,6 +240,38 @@ TOOL_SCHEMAS = [
                 "replace": {"type": "string", "description": "Novo texto que substituirá o termo de busca."},
             },
             "required": ["path", "search", "replace"],
+        },
+    },
+    {
+        "name": "grep",
+        "description": "Busca texto literal ou expressão regular em um arquivo ou recursivamente em um diretório.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "pattern": {
+                    "type": "string",
+                    "description": "Texto literal ou padrão regex a ser buscado.",
+                },
+                "path": {
+                    "type": "string",
+                    "description": "Arquivo ou diretório alvo da busca. Padrão é '.'.",
+                },
+                "regex": {
+                    "type": "boolean",
+                    "description": "Se verdadeiro, interpreta 'pattern' como expressão regular. Padrão é false.",
+                },
+                "file_pattern": {
+                    "type": "string",
+                    "description": (
+                        "Filtro glob para nomes de arquivos ao percorrer diretórios (ex.: '*.py'). Padrão é '*'."
+                    ),
+                },
+                "max_results": {
+                    "type": "integer",
+                    "description": "Número máximo de ocorrências retornadas. Padrão é 50.",
+                },
+            },
+            "required": ["pattern"],
         },
     },
 ]
