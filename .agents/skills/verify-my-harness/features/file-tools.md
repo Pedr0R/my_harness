@@ -1,6 +1,6 @@
 # Agent file tools
 
-Agent file tools let a user ask the SWE-Agent in the interactive chat to create files (`write_file`), inspect numbered file contents (`read_file`), apply exact single-match text replacements (`search_replace`), and search text or regex across files (`grep`) inside the active workspace.
+Agent file tools let a user ask the SWE-Agent in the interactive chat to create files (`write_file`), inspect numbered file contents (`read_file`), apply exact single-match text replacements (`search_replace`), search text or regex across files (`grep`), list directory trees (`list_dir`), and locate files by glob pattern (`find_files`) inside the active workspace.
 
 ## Sub-features
 
@@ -9,10 +9,12 @@ Agent file tools let a user ask the SWE-Agent in the interactive chat to create 
 - `file-read` reads an existing file and reports its contents back in chat.
 - `file-search-replace-ambiguous` refuses to silently overwrite when the search text appears zero or multiple times and reports the error cleanly in chat.
 - `file-grep` searches literal substrings or regular expressions in a single file or recursively across a directory with optional `file_pattern` filtering and `max_results` capping, skipping ignored directories, sensitive files, escaping symlinks, and binary files.
+- `file-list-dir` lists directory entries hierarchically up to `max_depth` levels with `/` suffixes on subdirectories and sorted output, skipping ignored directories, sensitive files/dirs, and escaping symlinks/junctions.
+- `file-find-files` walks a directory recursively and returns sorted POSIX relative paths matching a filename or relative-path glob pattern, skipping ignored directories, sensitive files/dirs, and escaping symlinks/junctions.
 
 ## How to get to it (user POV)
 
-- Run `python main.py` in a terminal and ask the agent at the `Você: ` prompt to create, read, edit, or search files in the current directory.
+- Run `python main.py` in a terminal and ask the agent at the `Você: ` prompt to create, read, edit, list, find, or search files in the current directory.
 
 ## Driving it with control_harness.py
 
@@ -28,7 +30,10 @@ Preconditions:
 - **Recursive grep with `file_pattern`.** Seed a Python file and a Markdown file containing the same token, then ask the agent to call `grep` restricted to `*.py`. Run:
   `python .agents/skills/verify-my-harness/scripts/control_harness.py drive --run-id verify-grep --feature file-tools --entry-point "python main.py (grep)" --seed-file "src/app.py=MARKER = 42\n" --seed-file "notes.md=MARKER in docs\n" --input "Use a ferramenta grep para buscar MARKER apenas em arquivos *.py e informe o arquivo e a linha encontrados." --input "memory" --input "exit"`
   The session exits with code `0`, `memory` shows the `grep` tool call and `src/app.py:1: MARKER = 42` in tool output, and `notes.md` is excluded.
-- **Proof.** Inspect `%TEMP%\my-harness-verify\evidence\verify-files\file-tools\report.json` and `transcript.txt` (or `verify-grep` for grep runs). Confirm both the chat output and `workspace_files_after["hello.txt"]["content"]` / `workspace_files_after["notes/todo.txt"]["content"]` on disk.
+- **Directory listing and glob file discovery (`list_dir` and `find_files`).** Seed nested Python and Markdown files, then ask the agent to inspect the workspace tree with `list_dir` (`max_depth=2`) and locate Python files under `pkg/` with `find_files`. Run:
+  `python .agents/skills/verify-my-harness/scripts/control_harness.py drive --run-id verify-explore --feature file-tools --entry-point "python main.py (list_dir, find_files)" --seed-file "pkg/mod.py=x = 1\n" --seed-file "pkg/readme.md=docs\n" --seed-file "root.txt=top\n" --input "Use a ferramenta list_dir com max_depth=2 para listar o diretório atual." --input "Use a ferramenta find_files com pattern='pkg/*.py' e informe os caminhos encontrados." --input "memory" --input "exit"`
+  The session exits with code `0`, `memory` shows `list_dir` returning `pkg/`, indented `mod.py`/`readme.md`, and `root.txt`, and `find_files` returning `pkg/mod.py` while excluding `pkg/readme.md` and `root.txt`.
+- **Proof.** Inspect `%TEMP%\my-harness-verify\evidence\verify-files\file-tools\report.json` and `transcript.txt` (or `verify-grep` / `verify-explore` for search and exploration runs). Confirm both the chat output and `workspace_files_after["hello.txt"]["content"]` / `workspace_files_after["notes/todo.txt"]["content"]` on disk.
 
 ## Gotchas
 
@@ -36,5 +41,5 @@ Preconditions:
 - Always run inside an isolated scratch workspace (`control_harness.py drive` does this by default) so file edits never touch repository files.
 - When `read_file` is called with a nonzero `offset`, the returned line-number prefix still starts counting from `1` for the sliced window rather than `offset + 1`.
 - `search_replace` requires the search string to occur **exactly once** in the file; duplicate or missing matches return an error message to the agent instead of modifying the file.
-- `grep` defaults `path` to `"."` when omitted, skips `.git`, `__pycache__`, `.venv`, `venv`, `node_modules`, `.pytest_cache`, `.ruff_cache`, `.sessions`, sensitive files (`.env`, keys), escaping symlinks, and binary files (NUL bytes in the first 8192 bytes).
+- `grep`, `list_dir`, and `find_files` default `path` to `"."` when omitted and share the same walk boundary: skipping `.git`, `__pycache__`, `.venv`, `venv`, `node_modules`, `.pytest_cache`, `.ruff_cache`, `.sessions`, sensitive files (`.env`, keys), and escaping symlinks/junctions (`grep` also skips binary files containing NUL bytes in the first 8192 bytes).
 - Clean up scratch state after the run with `python .agents/skills/verify-my-harness/scripts/control_harness.py cleanup --run-id verify-files`.
