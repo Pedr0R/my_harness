@@ -175,6 +175,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=[],
         help="Desabilita um guardrail específico (pode ser repetido; use 'all' para desabilitar todos).",
     )
+    parser.add_argument(
+        "--no-checkpoint",
+        dest="checkpointing",
+        action="store_false",
+        default=True,
+        help="Desabilita checkpoint automático de workspace e rollback em caso de falha.",
+    )
     return parser.parse_args(argv)
 
 
@@ -182,6 +189,7 @@ async def terminal_chat(
     session_id: str | None = None,
     sessions_dir: str | pathlib.Path = DEFAULT_SESSIONS_DIR,
     disabled_guardrails: list[str] | None = None,
+    checkpointing: bool = True,
 ) -> dict[str, Any]:
     provider = get_provider("gemini", model="gemini-3.5-flash-lite")
     guardrails_config = build_guardrails_config(disabled_guardrails)
@@ -193,6 +201,7 @@ async def terminal_chat(
             "Mantenha o contexto das mensagens anteriores."
         ),
         guardrails=build_guardrails(guardrails_config),
+        checkpointing=checkpointing,
     )
 
     sessions_path = pathlib.Path(sessions_dir)
@@ -240,6 +249,7 @@ async def terminal_chat(
     print("          digite 'memory' para visualizar a memória da sessão.")
     print("          digite '/load <session_id|last>' para carregar uma sessão salva.")
     print("          digite '/sessions' para listar as sessões salvas.")
+    print("          digite '/undo' para desfazer as alterações do último turno.")
     if resumed:
         interactions = len(session_data["history"]) // 2
         print(
@@ -311,6 +321,16 @@ async def terminal_chat(
                 print(f"\n[Erro ao carregar sessão]: {exc}\n")
             continue
 
+        # Comando para desfazer alterações do último turno no workspace
+        if lower_cmd in ("/undo", "/rollback"):
+            result = agent.undo_last_turn()
+            if result.ok:
+                print(f"\n[Rollback]: {result.message}")
+            else:
+                print(f"\n[Rollback indisponível]: {result.message}")
+            print("-" * 60 + "\n")
+            continue
+
         # Comando extra para visualizar a memória atual da sessão
         if lower_cmd == "memory":
             print("\n[Memória da Sessão Atual]:")
@@ -340,13 +360,26 @@ async def terminal_chat(
             persist_session()
             print(f"\n[Limite atingido]: {exc}\n")
             continue
+        except KeyboardInterrupt:
+            if agent.n_turns == prev_turns:
+                del agent.messages[prev_msg_count:]
+                session_data["history"].pop()
+            else:
+                persist_session()
+            print("\n[Interrompido pelo usuário]")
+            if agent.last_rollback_message:
+                print(f"\n[Rollback automático]: {agent.last_rollback_message}")
+            print("-" * 60)
+            continue
         except Exception as exc:
             if agent.n_turns == prev_turns:
                 del agent.messages[prev_msg_count:]
                 session_data["history"].pop()
             else:
                 persist_session()
-            print(f"\n{_format_provider_error(exc)}\n")
+            print(f"\n{_format_provider_error(exc)}")
+            if agent.last_rollback_message:
+                print(f"\n[Rollback automático]: {agent.last_rollback_message}")
             print("-" * 60)
             continue
 
@@ -388,5 +421,6 @@ if __name__ == "__main__":
             session_id=cli_args.session_id,
             sessions_dir=cli_args.sessions_dir,
             disabled_guardrails=cli_args.disable_guardrail,
+            checkpointing=cli_args.checkpointing,
         )
     )

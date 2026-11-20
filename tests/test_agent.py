@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import pathlib
+import subprocess
 import tempfile
 import unittest
 from typing import Any
@@ -12,6 +13,7 @@ from google.genai import types
 
 from agent import Agent, TOOL_SCHEMAS
 from guardrails.base import BaseGuardrail, GuardrailResult
+import main
 from providers.base import ModelResponse, ToolCall
 
 
@@ -339,6 +341,161 @@ class TestAgentSessionPersistence(unittest.TestCase):
             path.write_text(body, encoding="utf-8")
             with self.assertRaises(ValueError, msg=f"Failed for payload {idx}: {body}"):
                 agent.load_from_file(path)
+
+
+class FailingStepProvider:
+    def __init__(self, steps: list[ModelResponse | BaseException]) -> None:
+        self._steps = list(steps)
+
+    async def complete(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+    ) -> ModelResponse:
+        step = self._steps.pop(0)
+        if isinstance(step, BaseException):
+            raise step
+        return step
+
+
+class TestAgentWorkspaceCheckpointing(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.repo = pathlib.Path(self._tmp.name).resolve() / "repo"
+        self.repo.mkdir()
+        subprocess.run(["git", "init"], cwd=self.repo, check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=self.repo, check=True)
+        subprocess.run(["git", "config", "user.name", "Test User"], cwd=self.repo, check=True)
+        (self.repo / "app.py").write_text("VALUE = 1\n", encoding="utf-8")
+        subprocess.run(["git", "add", "-A"], cwd=self.repo, check=True)
+        subprocess.run(["git", "commit", "-m", "initial"], cwd=self.repo, check=True, capture_output=True)
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def test_auto_rollback_on_unhandled_provider_error_after_tool_edit(self) -> None:
+        app_file = self.repo / "app.py"
+        new_file = self.repo / "generated.txt"
+        provider = FailingStepProvider(
+            [
+                ModelResponse(
+                    content="editing files",
+                    tool_calls=[
+                        ToolCall(
+                            id="call_edit",
+                            name="write_file",
+                            args={"path": str(app_file), "content": "VALUE = 999\n"},
+                        ),
+                        ToolCall(
+                            id="call_create",
+                            name="write_file",
+                            args={"path": str(new_file), "content": "partial\n"},
+                        ),
+                    ],
+                ),
+                RuntimeError("provider outage on turn 2"),
+            ]
+        )
+        agent = Agent(
+            model=provider,
+            instructions="sys",
+            checkpointing=True,
+            workspace_dir=self.repo,
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "provider outage"):
+            asyncio.run(agent.run("update app"))
+
+        self.assertEqual(app_file.read_text(encoding="utf-8"), "VALUE = 1\n")
+        self.assertFalse(new_file.exists())
+        self.assertIsNotNone(agent.last_rollback_message)
+        self.assertIn("Workspace restaurado", agent.last_rollback_message or "")
+
+    def test_undo_last_turn_reverts_completed_turn_and_reports_empty_when_exhausted(self) -> None:
+        app_file = self.repo / "app.py"
+        new_file = self.repo / "extra.txt"
+        provider = FakeProvider(
+            [
+                ModelResponse(
+                    content="writing",
+                    tool_calls=[
+                        ToolCall(
+                            id="call_1",
+                            name="write_file",
+                            args={"path": str(app_file), "content": "VALUE = 2\n"},
+                        ),
+                        ToolCall(
+                            id="call_2",
+                            name="write_file",
+                            args={"path": str(new_file), "content": "hello\n"},
+                        ),
+                    ],
+                ),
+                ModelResponse(content="Done."),
+            ]
+        )
+        agent = Agent(
+            model=provider,
+            instructions="sys",
+            checkpointing=True,
+            workspace_dir=self.repo,
+        )
+
+        reply = asyncio.run(agent.run("apply changes"))
+        self.assertEqual(reply, "Done.")
+        self.assertEqual(app_file.read_text(encoding="utf-8"), "VALUE = 2\n")
+        self.assertTrue(new_file.exists())
+
+        undo_res = agent.undo_last_turn()
+        self.assertTrue(undo_res.ok)
+        self.assertEqual(app_file.read_text(encoding="utf-8"), "VALUE = 1\n")
+        self.assertFalse(new_file.exists())
+
+        empty_res = agent.undo_last_turn()
+        self.assertFalse(empty_res.ok)
+        self.assertFalse(empty_res.active)
+
+    def test_limit_stop_preserves_partial_work_without_auto_rollback(self) -> None:
+        app_file = self.repo / "app.py"
+        provider = FakeProvider(
+            [
+                ModelResponse(
+                    content="step 1",
+                    tool_calls=[
+                        ToolCall(
+                            id="call_1",
+                            name="write_file",
+                            args={"path": str(app_file), "content": "VALUE = 42\n"},
+                        )
+                    ],
+                ),
+                ModelResponse(content="unreachable"),
+            ]
+        )
+        agent = Agent(
+            model=provider,
+            instructions="sys",
+            max_turns=1,
+            checkpointing=True,
+            workspace_dir=self.repo,
+        )
+
+        with self.assertRaises(RuntimeError) as ctx:
+            asyncio.run(agent.run("edit and stop on limit"))
+        self.assertIsInstance(ctx.exception.__cause__, StopIteration)
+        self.assertIsNone(agent.last_rollback_message)
+        self.assertEqual(app_file.read_text(encoding="utf-8"), "VALUE = 42\n")
+
+        undo_res = agent.undo_last_turn()
+        self.assertTrue(undo_res.ok)
+        self.assertEqual(app_file.read_text(encoding="utf-8"), "VALUE = 1\n")
+
+    def test_cli_parse_args_no_checkpoint_flag(self) -> None:
+        default_args = main.parse_args([])
+        self.assertTrue(default_args.checkpointing)
+
+        disabled_args = main.parse_args(["--no-checkpoint"])
+        self.assertFalse(disabled_args.checkpointing)
 
 
 if __name__ == "__main__":
