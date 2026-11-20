@@ -1,6 +1,6 @@
 # Agent file tools
 
-Agent file tools let a user ask the SWE-Agent in the interactive chat to create files (`write_file`), inspect numbered file contents (`read_file`), and apply exact single-match text replacements (`search_replace`) inside the active workspace.
+Agent file tools let a user ask the SWE-Agent in the interactive chat to create files (`write_file`), inspect numbered file contents (`read_file`), apply exact single-match text replacements (`search_replace`), and search text or regex across files (`grep`) inside the active workspace.
 
 ## Sub-features
 
@@ -8,10 +8,11 @@ Agent file tools let a user ask the SWE-Agent in the interactive chat to create 
 - `file-search-replace` updates a unique string inside an existing file without altering surrounding lines.
 - `file-read` reads an existing file and reports its contents back in chat.
 - `file-search-replace-ambiguous` refuses to silently overwrite when the search text appears zero or multiple times and reports the error cleanly in chat.
+- `file-grep` searches literal substrings or regular expressions in a single file or recursively across a directory with optional `file_pattern` filtering and `max_results` capping, skipping ignored directories, sensitive files, escaping symlinks, and binary files.
 
 ## How to get to it (user POV)
 
-- Run `python main.py` in a terminal and ask the agent at the `Você: ` prompt to create, read, or edit a file in the current directory.
+- Run `python main.py` in a terminal and ask the agent at the `Você: ` prompt to create, read, edit, or search files in the current directory.
 
 ## Driving it with control_harness.py
 
@@ -24,7 +25,10 @@ Preconditions:
 - **Write, edit, and read round-trip.** Seed `notes/todo.txt` with `status=draft\nowner=verify\n`, then drive three turns in one isolated session: create `hello.txt`, replace `status=draft` with `status=done` in `notes/todo.txt`, and read both files back. Run:
   `python .agents/skills/verify-my-harness/scripts/control_harness.py drive --run-id verify-files --feature file-tools --entry-point "python main.py (write_file, search_replace, read_file)" --seed-file "notes/todo.txt=status=draft\nowner=verify\n" --input "Use a ferramenta write_file para criar o arquivo hello.txt com o conteúdo exato: linha um" --input "Use a ferramenta search_replace no arquivo notes/todo.txt para trocar status=draft por status=done." --input "Use a ferramenta read_file para ler notes/todo.txt e responda exatamente com o conteúdo lido." --input "memory" --input "exit"`
   The session exits with code `0`, `memory` shows `Total de turnos internos` greater than 3 (reflecting tool-call turns plus final replies), the third `Agente:` reply shows `status=done` and `owner=verify`, and `report.json` shows `workspace_diff.created` containing `hello.txt` (with content `linha um`) and `workspace_diff.modified` containing `notes/todo.txt` (with `status=done` and `owner=verify`).
-- **Proof.** Inspect `%TEMP%\my-harness-verify\evidence\verify-files\file-tools\report.json` and `transcript.txt`. Confirm both the chat output and `workspace_files_after["hello.txt"]["content"]` / `workspace_files_after["notes/todo.txt"]["content"]` on disk.
+- **Recursive grep with `file_pattern`.** Seed a Python file and a Markdown file containing the same token, then ask the agent to call `grep` restricted to `*.py`. Run:
+  `python .agents/skills/verify-my-harness/scripts/control_harness.py drive --run-id verify-grep --feature file-tools --entry-point "python main.py (grep)" --seed-file "src/app.py=MARKER = 42\n" --seed-file "notes.md=MARKER in docs\n" --input "Use a ferramenta grep para buscar MARKER apenas em arquivos *.py e informe o arquivo e a linha encontrados." --input "memory" --input "exit"`
+  The session exits with code `0`, `memory` shows the `grep` tool call and `src/app.py:1: MARKER = 42` in tool output, and `notes.md` is excluded.
+- **Proof.** Inspect `%TEMP%\my-harness-verify\evidence\verify-files\file-tools\report.json` and `transcript.txt` (or `verify-grep` for grep runs). Confirm both the chat output and `workspace_files_after["hello.txt"]["content"]` / `workspace_files_after["notes/todo.txt"]["content"]` on disk.
 
 ## Gotchas
 
@@ -32,4 +36,5 @@ Preconditions:
 - Always run inside an isolated scratch workspace (`control_harness.py drive` does this by default) so file edits never touch repository files.
 - When `read_file` is called with a nonzero `offset`, the returned line-number prefix still starts counting from `1` for the sliced window rather than `offset + 1`.
 - `search_replace` requires the search string to occur **exactly once** in the file; duplicate or missing matches return an error message to the agent instead of modifying the file.
+- `grep` defaults `path` to `"."` when omitted, skips `.git`, `__pycache__`, `.venv`, `venv`, `node_modules`, `.pytest_cache`, `.ruff_cache`, `.sessions`, sensitive files (`.env`, keys), escaping symlinks, and binary files (NUL bytes in the first 8192 bytes).
 - Clean up scratch state after the run with `python .agents/skills/verify-my-harness/scripts/control_harness.py cleanup --run-id verify-files`.

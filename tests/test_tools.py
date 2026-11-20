@@ -3,12 +3,14 @@ from __future__ import annotations
 import pathlib
 import sys
 import tempfile
+import time
 import unittest
 
 from agent import (
     _truncate,
     discover_context,
     tool_bash,
+    tool_grep,
     tool_read_file,
     tool_search_replace,
     tool_write_file,
@@ -106,6 +108,145 @@ class TestFileTools(unittest.TestCase):
         self.assertTrue(res.startswith("ERRO:"))
         self.assertIn("2x", res)
         self.assertEqual(target.read_text(encoding="utf-8"), original)
+
+
+class TestToolGrep(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = pathlib.Path(self._tmp.name).resolve()
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def test_literal_search_across_nested_files_and_single_file(self) -> None:
+        (self.root / "alpha.py").write_text("first\nhello world [literal]\nlast\n", encoding="utf-8")
+        nested = self.root / "pkg" / "beta.txt"
+        nested.parent.mkdir(parents=True)
+        nested.write_text("hello world [literal] again\nother\n", encoding="utf-8")
+        (self.root / "unused.txt").write_text("nothing here\n", encoding="utf-8")
+
+        dir_out = tool_grep("hello world [literal]", path=str(self.root))
+        self.assertEqual(
+            dir_out.splitlines(),
+            [
+                "alpha.py:2: hello world [literal]",
+                "pkg/beta.txt:1: hello world [literal] again",
+            ],
+        )
+
+        file_out = tool_grep("hello world [literal]", path=str(nested))
+        self.assertEqual(file_out, f"{nested.as_posix()}:1: hello world [literal] again")
+
+    def test_regex_search_and_invalid_regex_error(self) -> None:
+        target = self.root / "funcs.py"
+        target.write_text("def calc_1():\n    pass\ndef other():\ndef calc_42():\n", encoding="utf-8")
+
+        out = tool_grep(r"def\s+calc_\d+", path=str(self.root), regex=True)
+        self.assertEqual(
+            out.splitlines(),
+            [
+                "funcs.py:1: def calc_1():",
+                "funcs.py:4: def calc_42():",
+            ],
+        )
+
+        err = tool_grep("[unclosed", path=str(self.root), regex=True)
+        self.assertTrue(err.startswith("ERRO: expressão regular inválida:"))
+
+    def test_file_pattern_filters_directory_walk(self) -> None:
+        (self.root / "app.py").write_text("TARGET_TOKEN = 1\n", encoding="utf-8")
+        (self.root / "notes.md").write_text("TARGET_TOKEN in docs\n", encoding="utf-8")
+        sub = self.root / "sub"
+        sub.mkdir()
+        (sub / "helper.py").write_text("return TARGET_TOKEN\n", encoding="utf-8")
+
+        out = tool_grep("TARGET_TOKEN", path=str(self.root), file_pattern="*.py")
+        self.assertEqual(
+            out.splitlines(),
+            [
+                "app.py:1: TARGET_TOKEN = 1",
+                "sub/helper.py:1: return TARGET_TOKEN",
+            ],
+        )
+
+    def test_ignores_excluded_dirs_sensitive_files_and_binary_files(self) -> None:
+        ignored_files = [
+            ".git/config",
+            "__pycache__/mod.py",
+            ".venv/lib.py",
+            "node_modules/pkg/index.js",
+            ".env",
+            ".env.local",
+            "certs/private.key",
+        ]
+        for rel in ignored_files:
+            p = self.root / rel
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text("NEEDLE_SECRET\n", encoding="utf-8")
+
+        (self.root / "binary.dat").write_bytes(b"NEEDLE_SECRET\x00binary_payload")
+        (self.root / "visible.txt").write_text("NEEDLE_SECRET visible\n", encoding="utf-8")
+
+        out = tool_grep("NEEDLE_SECRET", path=str(self.root))
+        self.assertEqual(out, "visible.txt:1: NEEDLE_SECRET visible")
+
+    def test_max_results_cap_and_zero_matches(self) -> None:
+        target = self.root / "many.txt"
+        target.write_text("\n".join(f"match line {i}" for i in range(1, 11)) + "\n", encoding="utf-8")
+
+        capped = tool_grep("match line", path=str(self.root), max_results=3)
+        self.assertEqual(
+            capped.splitlines(),
+            [
+                "many.txt:1: match line 1",
+                "many.txt:2: match line 2",
+                "many.txt:3: match line 3",
+                "[limite de 3 resultados atingido]",
+            ],
+        )
+
+        exact = tool_grep("match line", path=str(self.root), max_results=10)
+        self.assertEqual(len(exact.splitlines()), 10)
+        self.assertNotIn("[limite de", exact)
+
+        none_out = tool_grep("DOES_NOT_EXIST_XYZ", path=str(self.root))
+        self.assertEqual(none_out, "Nenhuma ocorrência encontrada.")
+
+    def test_error_handling_for_empty_pattern_invalid_limit_and_missing_path(self) -> None:
+        self.assertEqual(
+            tool_grep("", path=str(self.root)),
+            "ERRO: padrão de busca não pode ser vazio",
+        )
+        self.assertEqual(
+            tool_grep("abc", path=str(self.root), max_results=0),
+            "ERRO: max_results deve ser maior que zero",
+        )
+        self.assertEqual(
+            tool_grep("abc", path=str(self.root), max_results=-1),
+            "ERRO: max_results deve ser maior que zero",
+        )
+        missing = self.root / "no_such_dir"
+        err = tool_grep("abc", path=str(missing))
+        self.assertTrue(err.startswith("ERRO: caminho não encontrado:"))
+
+    def test_performance_200_files_under_500ms(self) -> None:
+        for d in range(10):
+            subdir = self.root / f"dir_{d:02d}"
+            subdir.mkdir()
+            for f in range(20):
+                content = f"line 1\nline 2\nfile {d}_{f}\n"
+                if d == 9 and f == 19:
+                    content += "NEEDLE_PERF_TARGET\n"
+                (subdir / f"file_{f:02d}.py").write_text(content, encoding="utf-8")
+
+        tool_grep("__WARMUP_ABSENT_TOKEN__", path=str(self.root))
+
+        start = time.perf_counter()
+        out = tool_grep("NEEDLE_PERF_TARGET", path=str(self.root))
+        elapsed = time.perf_counter() - start
+
+        self.assertEqual(out, "dir_09/file_19.py:4: NEEDLE_PERF_TARGET")
+        self.assertLess(elapsed, 0.5, f"grep over 200 files took {elapsed:.3f}s (>= 0.5s)")
 
 
 class TestToolBash(unittest.TestCase):

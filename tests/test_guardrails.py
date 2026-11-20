@@ -10,7 +10,7 @@ import unittest
 from typing import Any
 from unittest import mock
 
-from agent import Agent
+from agent import Agent, tool_grep
 from guardrails import (
     BaseGuardrail,
     CommandSafetyGuardrail,
@@ -148,6 +148,83 @@ class TestPathSandboxingGuardrail(unittest.TestCase):
         disabled = PathSandboxingGuardrail(root_dir=self.root, enabled=False)
         self.assertTrue(disabled.check_tool_call("read_file", {"path": "../outside.txt"}).allowed)
         self.assertTrue(disabled.check_tool_call("read_file", {"path": ".env"}).allowed)
+
+    def _create_escaping_link(self, outside_file: pathlib.Path, link_name: str, dir_name: str) -> str | None:
+        link_path = self.root / link_name
+        try:
+            os.symlink(outside_file, link_path)
+            return link_name
+        except OSError:
+            if os.name == "nt":
+                junction = self.root / dir_name
+                proc = subprocess.run(
+                    ["cmd", "/c", "mklink", "/J", str(junction), str(self.outside)],
+                    capture_output=True,
+                    text=True,
+                )
+                if proc.returncode == 0:
+                    return f"{dir_name}/{outside_file.name}"
+            return None
+
+    def test_grep_allows_omitted_path_and_valid_workspace_paths(self) -> None:
+        allowed_calls: list[dict[str, Any]] = [
+            {"pattern": "hello"},
+            {"pattern": "hello", "path": "."},
+            {"pattern": "hello", "path": "src/app.py"},
+            {"pattern": "hello", "path": str(self.root / "nested")},
+        ]
+        for args in allowed_calls:
+            result = self.guardrail.check_tool_call("grep", args)
+            self.assertTrue(result.allowed, f"grep should allow {args}: {result.reason}")
+
+    def test_grep_blocks_outside_sensitive_empty_and_escaping_symlink(self) -> None:
+        blocked_paths: list[Any] = [
+            "..",
+            "../outside/secret.txt",
+            str(self.outside),
+            str(self.outside / "secret.txt"),
+            ".env",
+            ".env.local",
+            ".git",
+            ".git/config",
+            "",
+            "   ",
+            None,
+            123,
+        ]
+        for path in blocked_paths:
+            result = self.guardrail.check_tool_call("grep", {"pattern": "secret", "path": path})
+            self.assertFalse(result.allowed, f"grep should block path={path!r}")
+            self.assertTrue(result.reason)
+
+        outside_file = self.outside / "grep_escape.txt"
+        outside_file.write_text("SECRET_OUTSIDE", encoding="utf-8")
+        target_arg = self._create_escaping_link(outside_file, "grep_escape_link.txt", "grep_escape_dir")
+        if target_arg is None:
+            self.skipTest("OS does not allow creating symlinks or junctions in test env")
+
+        result = self.guardrail.check_tool_call("grep", {"pattern": "SECRET", "path": target_arg})
+        self.assertFalse(result.allowed)
+        self.assertTrue(result.reason)
+
+    def test_tool_grep_walk_skips_env_and_escaping_symlink(self) -> None:
+        (self.root / "safe.txt").write_text("SHARED_TOKEN safe\n", encoding="utf-8")
+        (self.root / ".env").write_text("API_KEY=SHARED_TOKEN_ENV\n", encoding="utf-8")
+        outside_file = self.outside / "leaked.txt"
+        outside_file.write_text("SHARED_TOKEN_OUTSIDE\n", encoding="utf-8")
+        link_created = self._create_escaping_link(outside_file, "walk_escape.txt", "walk_escape_dir")
+
+        prev_cwd = pathlib.Path.cwd()
+        try:
+            os.chdir(self.root)
+            out = tool_grep("SHARED_TOKEN", path=".")
+        finally:
+            os.chdir(prev_cwd)
+
+        self.assertEqual(out, "safe.txt:1: SHARED_TOKEN safe")
+        self.assertNotIn("SHARED_TOKEN_ENV", out)
+        if link_created is not None:
+            self.assertNotIn("SHARED_TOKEN_OUTSIDE", out)
 
 
 class TestCommandSafetyGuardrail(unittest.TestCase):
