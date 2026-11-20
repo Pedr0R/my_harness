@@ -27,10 +27,12 @@ Um harness leve e modular para agentes autônomos de software (SWE Agents) em Py
 my_harness/
 ├── .env                # Chaves de API e configurações de ambiente
 ├── .sessions/          # Histórico persistido de sessões em JSON (ignorado no Git)
-├── main.py             # Chat interativo no terminal
-├── agent.py            # Loop de execução, memória e ferramentas do agente
-├── workspace.py        # Checkpoint e rollback automático de workspace via Git
+├── main.py             # Chat interativo e entrypoint CLI
+├── agent.py            # Loop de execução, compactação e limites do agente
+├── session.py          # Persistência e validação de sessões em .sessions/
+├── workspace.py        # Checkpoint/rollback via Git e política neutra de caminhos sensíveis
 ├── pyproject.toml      # Configuração do pytest e do linter ruff
+├── tools/              # Ferramentas nativas desacopladas (ToolSpec, shell, files, search)
 ├── guardrails/         # Validação, sandboxing, redação de segredos e detecção de loop
 ├── tests/              # Suíte de testes unitários (pytest / unittest)
 └── providers/          # Camada desacoplada de modelos
@@ -75,9 +77,10 @@ python main.py --session session_20261119_220000
 python main.py --session last
 ```
 
-Opcionalmente, você pode informar outro diretório de sessões com `--sessions-dir <caminho>` ou desabilitar guardrails específicos:
+Opcionalmente, você pode escolher o provedor/modelo, informar outro diretório de sessões com `--sessions-dir <caminho>` ou desabilitar guardrails específicos:
 
 ```bash
+python main.py --provider ollama --model llama3.2
 python main.py --disable-guardrail loop_detection
 python main.py --disable-guardrail all
 python main.py --no-checkpoint

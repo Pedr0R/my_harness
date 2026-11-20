@@ -8,9 +8,9 @@ import tempfile
 import time
 import unittest
 
-from agent import (
+from agent import discover_context
+from tools import (
     _truncate,
-    discover_context,
     tool_bash,
     tool_find_files,
     tool_grep,
