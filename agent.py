@@ -9,6 +9,7 @@ import pathlib
 import subprocess
 from typing import Any
 
+from guardrails import BaseGuardrail
 from providers import ModelProvider, get_provider
 
 
@@ -152,6 +153,7 @@ class Agent:
     max_turns: int = 50
     max_cost: float = 5.00
     compact_at_tokens: int = 120_000
+    guardrails: list[BaseGuardrail] = field(default_factory=list)
 
     def _token_estimate(self) -> int:
         """Estima o volume de tokens acumulado no histórico de mensagens."""
@@ -192,6 +194,9 @@ class Agent:
         """Limpa a memória de mensagens da sessão atual."""
         self.messages.clear()
         self.n_turns = 0
+        for guardrail in self.guardrails:
+            if hasattr(guardrail, "reset"):
+                guardrail.reset()
 
     def get_session_memory(self) -> dict[str, Any]:
         """Retorna a memória da sessão atual em formato de dicionário."""
@@ -269,6 +274,9 @@ class Agent:
         self.messages = [dict(m) for m in raw_messages]
         self.n_turns = n_turns
         self.cost = float(cost)
+        for guardrail in self.guardrails:
+            if hasattr(guardrail, "reset"):
+                guardrail.reset()
         return data
 
     async def run(self, task: str) -> str:
@@ -296,26 +304,54 @@ class Agent:
             if not tool_calls:
                 return resp.get("content", "")
 
-            # Execução sequencial das chamadas de ferramentas solicitadas pelo modelo
             for call in tool_calls:
                 call_name = call["name"] if isinstance(call, dict) else call.name
                 call_args = call["args"] if isinstance(call, dict) else call.args
                 call_id = call.get("id") if isinstance(call, dict) else getattr(call, "id", f"call_{call_name}")
 
-                try:
-                    fn = TOOLS.get(call_name)
-                    if not fn:
-                        out = f"ERRO: Ferramenta desconhecida '{call_name}'"
+                effective_args = dict(call_args) if isinstance(call_args, dict) else call_args
+                blocked = False
+                blocked_reason: str | None = None
+
+                for guardrail in self.guardrails:
+                    if not getattr(guardrail, "enabled", True):
+                        continue
+                    check = guardrail.check_tool_call(call_name, effective_args)
+                    if check.modified_args is not None:
+                        effective_args = check.modified_args
+                    if not check.allowed:
+                        blocked = True
+                        blocked_reason = check.reason
+                        break
+
+                if blocked:
+                    if not blocked_reason:
+                        out: Any = "Blocked by safety rules."
+                    elif blocked_reason.lower().startswith("blocked"):
+                        out = blocked_reason
                     else:
-                        out = fn(**call_args)
-                except Exception as e:
-                    out = f"ERRO: {type(e).__name__}: {e}"
+                        out = f"Blocked by guardrail: {blocked_reason}"
+                else:
+                    try:
+                        fn = TOOLS.get(call_name)
+                        if not fn:
+                            out = f"ERRO: Ferramenta desconhecida '{call_name}'"
+                        else:
+                            out = fn(**effective_args)
+                    except Exception as e:
+                        out = f"ERRO: {type(e).__name__}: {e}"
+
+                sanitized = str(out)
+                for guardrail in self.guardrails:
+                    if not getattr(guardrail, "enabled", True):
+                        continue
+                    sanitized = guardrail.sanitize_output(call_name, sanitized)
 
                 self.messages.append(
                     {
                         "role": "tool",
                         "tool_call_id": call_id,
                         "name": call_name,
-                        "content": _truncate(str(out)),
+                        "content": _truncate(sanitized),
                     }
                 )
