@@ -25,8 +25,9 @@ my_harness/
 ├── .sessions/          # Histórico persistido de sessões em JSON (ignorado no Git)
 ├── main.py             # Chat interativo no terminal
 ├── agent.py            # Loop de execução, memória e ferramentas do agente
+├── pyproject.toml      # Configuração do pytest e do linter ruff
 ├── guardrails/         # Validação, sandboxing, redação de segredos e detecção de loop
-├── tests/              # Suíte de testes unitários (unittest)
+├── tests/              # Suíte de testes unitários (pytest / unittest)
 └── providers/          # Camada desacoplada de modelos
     ├── base.py         # Protocolos (ModelProvider, ModelResponse, ToolCall)
     ├── factory.py      # Fábrica de provedores (get_provider)
@@ -78,11 +79,23 @@ python main.py --disable-guardrail all
 
 Também é possível controlar cada guardrail via variáveis de ambiente (`GUARDRAIL_PATH_SANDBOXING`, `GUARDRAIL_COMMAND_SAFETY`, `GUARDRAIL_SECRETS_REDACTION`, `GUARDRAIL_LOOP_DETECTION`) com `true`/`false`.
 
-### Testes Unitários:
+### Testes Unitários e Lint:
+
+Instale as dependências de desenvolvimento (`pytest` e `ruff`) e execute a suíte (nenhuma chave de API é necessária):
+
+```bash
+pip install pytest ruff
+pytest -v
+ruff check .
+```
+
+Os testes também são compatíveis com `unittest` da biblioteca padrão:
 
 ```bash
 python -m unittest discover -s tests -v
 ```
+
+O workflow de CI no GitHub Actions (`.github/workflows/ci.yml`) executa automaticamente `pytest` na matriz Python 3.10–3.13, `ruff check .` e a análise estrutural do repositório em cada push e pull request.
 
 ### Comandos no Terminal:
 - `exit` ou `sair` (também `quit` ou `q`): Encerra a conversa e exibe o resumo da sessão.

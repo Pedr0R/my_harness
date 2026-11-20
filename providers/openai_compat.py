@@ -6,7 +6,7 @@ from typing import Any
 import httpx
 from dotenv import load_dotenv
 
-from providers.base import ModelProvider, ModelResponse, ToolCall
+from providers.base import ModelResponse, ToolCall
 
 load_dotenv()
 
