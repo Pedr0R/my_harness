@@ -12,6 +12,7 @@ Um harness leve e modular para agentes autônomos de software (SWE Agents) em Py
   - `search_replace`: Substituição precisa de textos em arquivos.
 - **Chat Interativo no Terminal**: Conversação contínua com histórico e memória em array/dicionário.
 - **Persistência de Sessões**: Salvamento automático após cada turno em `.sessions/<session_id>.json` e retomada via CLI (`--session`) ou comando `/load`.
+- **Guardrails de Segurança**: Sandboxing de caminhos (`read_file`/`write_file`/`search_replace`), bloqueio de comandos destrutivos no `bash`, redação automática de segredos (`[REDACTED]`) e detecção de loops de ferramentas.
 - **Compactação de Contexto**: Redução automática de mensagens para evitar estourar a janela de contexto.
 
 ---
@@ -24,6 +25,8 @@ my_harness/
 ├── .sessions/          # Histórico persistido de sessões em JSON (ignorado no Git)
 ├── main.py             # Chat interativo no terminal
 ├── agent.py            # Loop de execução, memória e ferramentas do agente
+├── guardrails/         # Validação, sandboxing, redação de segredos e detecção de loop
+├── tests/              # Suíte de testes unitários (unittest)
 └── providers/          # Camada desacoplada de modelos
     ├── base.py         # Protocolos (ModelProvider, ModelResponse, ToolCall)
     ├── factory.py      # Fábrica de provedores (get_provider)
@@ -66,7 +69,20 @@ python main.py --session session_20261119_220000
 python main.py --session last
 ```
 
-Opcionalmente, você pode informar outro diretório de sessões com `--sessions-dir <caminho>`.
+Opcionalmente, você pode informar outro diretório de sessões com `--sessions-dir <caminho>` ou desabilitar guardrails específicos:
+
+```bash
+python main.py --disable-guardrail loop_detection
+python main.py --disable-guardrail all
+```
+
+Também é possível controlar cada guardrail via variáveis de ambiente (`GUARDRAIL_PATH_SANDBOXING`, `GUARDRAIL_COMMAND_SAFETY`, `GUARDRAIL_SECRETS_REDACTION`, `GUARDRAIL_LOOP_DETECTION`) com `true`/`false`.
+
+### Testes Unitários:
+
+```bash
+python -m unittest discover -s tests -v
+```
 
 ### Comandos no Terminal:
 - `exit` ou `sair` (também `quit` ou `q`): Encerra a conversa e exibe o resumo da sessão.
