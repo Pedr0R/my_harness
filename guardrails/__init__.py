@@ -1,4 +1,10 @@
-from guardrails.base import BaseGuardrail, GuardrailResult
+from guardrails.base import (
+    BaseGuardrail,
+    GuardrailResult,
+    reset_guardrails,
+    run_guardrail_checks,
+    sanitize_with_guardrails,
+)
 from guardrails.command_safety import CommandSafetyGuardrail
 from guardrails.config import GuardrailsConfig, build_guardrails
 from guardrails.loop_detection import LoopDetectionGuardrail
@@ -14,4 +20,7 @@ __all__ = [
     "LoopDetectionGuardrail",
     "GuardrailsConfig",
     "build_guardrails",
+    "reset_guardrails",
+    "run_guardrail_checks",
+    "sanitize_with_guardrails",
 ]
