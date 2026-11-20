@@ -61,7 +61,11 @@ def _format_provider_error(exc: Exception) -> str:
     text = str(exc)
     retry_match = re.search(r"retry in ([0-9]+(?:\.[0-9]+)?s)", text, flags=re.IGNORECASE)
     if "429" in text or "RESOURCE_EXHAUSTED" in text:
-        hint = f" Aguarde ~{retry_match.group(1)} e tente novamente." if retry_match else " Aguarde alguns segundos e tente novamente."
+        hint = (
+            f" Aguarde ~{retry_match.group(1)} e tente novamente."
+            if retry_match
+            else " Aguarde alguns segundos e tente novamente."
+        )
         return f"[Limite de requisições da API (429)]: cota temporariamente excedida.{hint}"
     first_line = text.splitlines()[0].strip() if text else type(exc).__name__
     return f"[Erro ao consultar o provedor]: {type(exc).__name__}: {first_line}"
@@ -184,7 +188,10 @@ async def terminal_chat(
     agent = Agent(
         name="SWE-Agent",
         model=provider,
-        instructions="Você é um assistente de engenharia de software conciso e prestativo. Mantenha o contexto das mensagens anteriores.",
+        instructions=(
+            "Você é um assistente de engenharia de software conciso e prestativo. "
+            "Mantenha o contexto das mensagens anteriores."
+        ),
         guardrails=build_guardrails(guardrails_config),
     )
 

@@ -6,7 +6,7 @@ from dotenv import load_dotenv
 from google import genai
 from google.genai import types
 
-from providers.base import ModelProvider, ModelResponse, ToolCall
+from providers.base import ModelResponse, ToolCall
 
 load_dotenv()
 

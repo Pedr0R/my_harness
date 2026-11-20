@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 from dataclasses import dataclass, field
 from datetime import datetime
 import json
@@ -78,7 +77,10 @@ TOOL_SCHEMAS = [
             "properties": {
                 "path": {"type": "string", "description": "Caminho absoluto ou relativo do arquivo a ser lido."},
                 "offset": {"type": "integer", "description": "Linha inicial de leitura (base 0). Padrão é 0."},
-                "limit": {"type": "integer", "description": "Quantidade máxima de linhas a serem lidas. Padrão é 2000."},
+                "limit": {
+                    "type": "integer",
+                    "description": "Quantidade máxima de linhas a serem lidas. Padrão é 2000.",
+                },
             },
             "required": ["path"],
         },
@@ -102,7 +104,10 @@ TOOL_SCHEMAS = [
             "type": "object",
             "properties": {
                 "path": {"type": "string", "description": "Caminho do arquivo a ser modificado."},
-                "search": {"type": "string", "description": "Texto exato a ser encontrado (deve ser único no arquivo)."},
+                "search": {
+                    "type": "string",
+                    "description": "Texto exato a ser encontrado (deve ser único no arquivo).",
+                },
                 "replace": {"type": "string", "description": "Novo texto que substituirá o termo de busca."},
             },
             "required": ["path", "search", "replace"],
@@ -283,7 +288,10 @@ class Agent:
         """Executa um turno de raciocínio e ação do agente para atender à tarefa."""
         # Se for o início da sessão, inicializa com a instrução do sistema
         if not self.messages:
-            system_content = self.instructions or f"Você é um agente de engenharia de software conciso e prestativo.\n\n{discover_context()}"
+            default_instructions = (
+                f"Você é um agente de engenharia de software conciso e prestativo.\n\n{discover_context()}"
+            )
+            system_content = self.instructions or default_instructions
             self.messages.append({"role": "system", "content": system_content})
 
         # Adiciona a mensagem do usuário à memória contínua da sessão
