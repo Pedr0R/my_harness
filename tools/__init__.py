@@ -19,9 +19,13 @@ FILE_TOOLS: frozenset[str] = frozenset(spec.name for spec in ALL_TOOL_SPECS if s
 DEFAULT_PATH_TOOLS: frozenset[str] = frozenset(
     spec.name for spec in ALL_TOOL_SPECS if spec.default_path is not None
 )
+APPROVAL_REQUIRED_TOOLS: frozenset[str] = frozenset(
+    spec.name for spec in ALL_TOOL_SPECS if spec.requires_approval
+)
 
 __all__ = [
     "ALL_TOOL_SPECS",
+    "APPROVAL_REQUIRED_TOOLS",
     "DEFAULT_PATH_TOOLS",
     "FILE_TOOLS",
     "IGNORED_DIRS",

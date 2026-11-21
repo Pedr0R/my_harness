@@ -24,6 +24,7 @@ class ToolSpec:
     handler: Callable[..., str]
     checks_path: bool = False
     default_path: str | None = None
+    requires_approval: bool = False
 
     def to_schema(self) -> dict[str, Any]:
         return {

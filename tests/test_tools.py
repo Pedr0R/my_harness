@@ -10,6 +10,8 @@ import unittest
 
 from agent import discover_context
 from tools import (
+    APPROVAL_REQUIRED_TOOLS,
+    TOOL_SCHEMAS,
     _truncate,
     tool_bash,
     tool_find_files,
@@ -538,6 +540,13 @@ class TestDiscoverContext(unittest.TestCase):
         self.assertIn(leaf_tag, ctx)
         self.assertLess(ctx.index(parent_tag), ctx.index(leaf_tag))
         self.assertNotIn(str(mid_dir / "AGENTS.md"), ctx)
+
+
+class TestToolSpecsApprovalMetadata(unittest.TestCase):
+    def test_approval_required_tools_and_clean_schemas(self) -> None:
+        self.assertEqual(APPROVAL_REQUIRED_TOOLS, frozenset({"bash", "write_file", "search_replace"}))
+        for schema in TOOL_SCHEMAS:
+            self.assertEqual(set(schema.keys()), {"name", "description", "parameters"})
 
 
 if __name__ == "__main__":

@@ -22,4 +22,5 @@ BASH_SPEC = ToolSpec(
         "required": ["cmd"],
     },
     handler=tool_bash,
+    requires_approval=True,
 )
