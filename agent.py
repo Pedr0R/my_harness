@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from enum import Enum
+import inspect
 import json
 import pathlib
-from typing import Any, Callable
+from typing import Any, Awaitable, Callable
 
 from guardrails import (
     BaseGuardrail,
@@ -13,13 +15,17 @@ from guardrails import (
 )
 from providers import ModelProvider, get_provider
 from session import load_session_file, save_session_file
-from tools import TOOLS, TOOL_SCHEMAS, _truncate
+from tools import APPROVAL_REQUIRED_TOOLS, TOOLS, TOOL_SCHEMAS, _truncate
 from workspace import CheckpointResult, WorkspaceCheckpoint
 
 
 __all__ = [
     "Agent",
     "AgentLimitError",
+    "ApprovalAction",
+    "ApprovalCallback",
+    "ApprovalDecision",
+    "ApprovalResult",
     "discover_context",
 ]
 
@@ -29,6 +35,55 @@ _MAX_CHECKPOINTS = 20
 
 class AgentLimitError(Exception):
     """Exceção levantada quando o agente atinge o limite configurado de turnos ou custo."""
+
+
+class ApprovalAction(str, Enum):
+    """Ações possíveis em uma decisão de aprovação humana (HitL)."""
+
+    APPROVE = "approve"
+    APPROVE_ALL = "approve_all"
+    REJECT = "reject"
+
+
+@dataclass(frozen=True)
+class ApprovalDecision:
+    """Resultado estruturado da verificação de aprovação para uma chamada de ferramenta."""
+
+    action: ApprovalAction
+    reason: str | None = None
+
+    @property
+    def approved(self) -> bool:
+        return self.action in (ApprovalAction.APPROVE, ApprovalAction.APPROVE_ALL)
+
+
+ApprovalResult = ApprovalDecision | ApprovalAction | bool
+ApprovalCallback = Callable[[str, dict[str, Any]], ApprovalResult | Awaitable[ApprovalResult]]
+
+
+def _normalize_approval_decision(raw: ApprovalResult) -> ApprovalDecision:
+    """Normaliza retornos de callback de aprovação para ApprovalDecision."""
+    if isinstance(raw, ApprovalDecision):
+        return raw
+    if isinstance(raw, ApprovalAction):
+        return ApprovalDecision(action=raw)
+    if isinstance(raw, bool):
+        return ApprovalDecision(action=ApprovalAction.APPROVE if raw else ApprovalAction.REJECT)
+    raise TypeError(f"Retorno inválido do callback de aprovação: {type(raw).__name__}.")
+
+
+def _format_rejection_message(tool_name: str, reason: str | None = None) -> str:
+    """Formata feedback estruturado enviado ao modelo quando o usuário recusa uma ferramenta."""
+    cleaned_reason = reason.strip() if reason else ""
+    if cleaned_reason:
+        return (
+            f"Ação recusada pelo usuário: a execução da ferramenta '{tool_name}' não foi aprovada. "
+            f"Motivo: {cleaned_reason}. Ajuste seu plano ou pergunte ao usuário como prosseguir."
+        )
+    return (
+        f"Ação recusada pelo usuário: a execução da ferramenta '{tool_name}' não foi aprovada. "
+        "Ajuste seu plano ou pergunte ao usuário como prosseguir."
+    )
 
 
 def _is_limit_stop(exc: BaseException) -> bool:
@@ -66,6 +121,9 @@ class Agent:
     tool_schemas: list[dict[str, Any]] = field(default_factory=lambda: list(TOOL_SCHEMAS))
     checkpointing: bool = False
     workspace_dir: str | pathlib.Path | None = None
+    auto_approve: bool = True
+    require_approval: set[str] = field(default_factory=lambda: set(APPROVAL_REQUIRED_TOOLS))
+    approval_callback: ApprovalCallback | None = None
     _checkpoints: list[WorkspaceCheckpoint] = field(default_factory=list, repr=False)
     last_rollback_message: str | None = field(default=None, repr=False)
 
@@ -165,21 +223,49 @@ class Agent:
         reset_guardrails(self.guardrails)
         return data
 
-    def _execute_tool_call(self, call_name: str, call_args: Any) -> str:
+    async def _request_approval(
+        self,
+        call_name: str,
+        effective_args: dict[str, Any],
+    ) -> ApprovalDecision:
+        """Solicita aprovação humana para ferramentas configuradas em require_approval."""
+        if self.auto_approve or call_name not in self.require_approval:
+            return ApprovalDecision(ApprovalAction.APPROVE)
+        if self.approval_callback is None:
+            return ApprovalDecision(
+                ApprovalAction.REJECT,
+                reason="nenhum callback de aprovação configurado",
+            )
+
+        raw = self.approval_callback(call_name, dict(effective_args))
+        if inspect.isawaitable(raw):
+            raw = await raw
+
+        decision = _normalize_approval_decision(raw)
+        if decision.action is ApprovalAction.APPROVE_ALL:
+            self.auto_approve = True
+        return decision
+
+    async def _execute_tool_call(self, call_name: str, call_args: Any) -> str:
         allowed, blocked_message, effective_args = run_guardrail_checks(
             self.guardrails, call_name, call_args
         )
         if not allowed:
             raw_output: Any = blocked_message or "Blocked by safety rules."
         else:
-            try:
-                fn = self.tools.get(call_name)
-                if not fn:
-                    raw_output = f"ERRO: Ferramenta desconhecida '{call_name}'"
+            fn = self.tools.get(call_name)
+            if not fn:
+                raw_output = f"ERRO: Ferramenta desconhecida '{call_name}'"
+            else:
+                approval_args = dict(effective_args) if isinstance(effective_args, dict) else {}
+                decision = await self._request_approval(call_name, approval_args)
+                if not decision.approved:
+                    raw_output = _format_rejection_message(call_name, decision.reason)
                 else:
-                    raw_output = fn(**effective_args)
-            except Exception as exc:
-                raw_output = f"ERRO: {type(exc).__name__}: {exc}"
+                    try:
+                        raw_output = fn(**effective_args)
+                    except Exception as exc:
+                        raw_output = f"ERRO: {type(exc).__name__}: {exc}"
 
         sanitized = sanitize_with_guardrails(self.guardrails, call_name, str(raw_output))
         return _truncate(sanitized)
@@ -224,12 +310,13 @@ class Agent:
                     call_args = call["args"] if isinstance(call, dict) else call.args
                     call_id = call.get("id") if isinstance(call, dict) else getattr(call, "id", f"call_{call_name}")
 
+                    tool_output = await self._execute_tool_call(call_name, call_args)
                     self.messages.append(
                         {
                             "role": "tool",
                             "tool_call_id": call_id,
                             "name": call_name,
-                            "content": self._execute_tool_call(call_name, call_args),
+                            "content": tool_output,
                         }
                     )
         except BaseException as exc:

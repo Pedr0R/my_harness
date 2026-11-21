@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 import os
 import pathlib
@@ -12,7 +13,8 @@ from unittest import mock
 
 from google.genai import types
 
-from agent import Agent, AgentLimitError, discover_context
+from agent import Agent, AgentLimitError, ApprovalAction, ApprovalDecision, discover_context
+from guardrails import CommandSafetyGuardrail, PathSandboxingGuardrail
 from guardrails.base import BaseGuardrail, GuardrailResult
 import main
 from providers.base import ModelResponse, ToolCall
@@ -556,6 +558,413 @@ class TestAgentWorkspaceCheckpointing(unittest.TestCase):
         custom_args = main.parse_args(["--provider", "ollama", "--model", "llama3.2"])
         self.assertEqual(custom_args.provider, "ollama")
         self.assertEqual(custom_args.model, "llama3.2")
+
+
+class TestAgentHumanInTheLoop(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = pathlib.Path(self._tmp.name).resolve()
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def test_sync_callback_approving_write_file_writes_to_disk(self) -> None:
+        target = self.root / "approved.txt"
+        seen: list[tuple[str, dict[str, Any]]] = []
+
+        def approve_cb(tool_name: str, args: dict[str, Any]) -> bool:
+            seen.append((tool_name, args))
+            return True
+
+        provider = FakeProvider(
+            [
+                ModelResponse(
+                    tool_calls=[
+                        ToolCall(
+                            id="call_w1",
+                            name="write_file",
+                            args={"path": str(target), "content": "approved_body"},
+                        )
+                    ]
+                ),
+                ModelResponse(content="Escrito com sucesso."),
+            ]
+        )
+        agent = Agent(
+            model=provider,
+            instructions="sys",
+            auto_approve=False,
+            approval_callback=approve_cb,
+        )
+
+        reply = asyncio.run(agent.run("write file"))
+        self.assertEqual(reply, "Escrito com sucesso.")
+        self.assertEqual(target.read_text(encoding="utf-8"), "approved_body")
+        self.assertEqual(len(seen), 1)
+        self.assertEqual(seen[0][0], "write_file")
+        self.assertEqual(seen[0][1]["path"], str(target))
+
+    def test_async_callback_rejecting_write_file_skips_disk_and_informs_model(self) -> None:
+        target = self.root / "rejected.txt"
+
+        async def reject_cb(_tool_name: str, _args: dict[str, Any]) -> ApprovalAction:
+            return ApprovalAction.REJECT
+
+        provider = FakeProvider(
+            [
+                ModelResponse(
+                    tool_calls=[
+                        ToolCall(
+                            id="call_w_rej",
+                            name="write_file",
+                            args={"path": str(target), "content": "should_not_exist"},
+                        )
+                    ]
+                ),
+                ModelResponse(content="Entendido, não escrevi o arquivo."),
+            ]
+        )
+        agent = Agent(
+            model=provider,
+            instructions="sys",
+            auto_approve=False,
+            approval_callback=reject_cb,
+        )
+
+        reply = asyncio.run(agent.run("try write"))
+        self.assertEqual(reply, "Entendido, não escrevi o arquivo.")
+        self.assertFalse(target.exists())
+        self.assertEqual(len(provider.calls), 2)
+
+        tool_msg = provider.calls[1][0][-1]
+        self.assertEqual(tool_msg["role"], "tool")
+        self.assertEqual(tool_msg["tool_call_id"], "call_w_rej")
+        self.assertEqual(tool_msg["name"], "write_file")
+        self.assertIn("recusada", tool_msg["content"].lower())
+        self.assertIn("write_file", tool_msg["content"])
+
+    def test_reject_decision_with_reason_surfaces_reason_and_skips_execution(self) -> None:
+        target = self.root / "protected.txt"
+        provider = FakeProvider(
+            [
+                ModelResponse(
+                    tool_calls=[
+                        ToolCall(
+                            id="call_reason",
+                            name="write_file",
+                            args={"path": str(target), "content": "x"},
+                        )
+                    ]
+                ),
+                ModelResponse(content="Plano ajustado."),
+            ]
+        )
+        agent = Agent(
+            model=provider,
+            instructions="sys",
+            auto_approve=False,
+            approval_callback=lambda _name, _args: ApprovalDecision(
+                ApprovalAction.REJECT,
+                reason="arquivo protegido",
+            ),
+        )
+
+        reply = asyncio.run(agent.run("write protected"))
+        self.assertEqual(reply, "Plano ajustado.")
+        self.assertFalse(target.exists())
+        tool_msgs = [m for m in agent.messages if m["role"] == "tool"]
+        self.assertEqual(len(tool_msgs), 1)
+        self.assertIn("arquivo protegido", tool_msgs[0]["content"])
+
+    def test_approve_all_approves_call_flips_auto_approve_and_skips_subsequent_prompts(self) -> None:
+        file_one = self.root / "one.txt"
+        file_two = self.root / "two.txt"
+        calls: list[str] = []
+
+        def approve_all_cb(tool_name: str, _args: dict[str, Any]) -> ApprovalDecision:
+            calls.append(tool_name)
+            return ApprovalDecision(ApprovalAction.APPROVE_ALL)
+
+        provider = FakeProvider(
+            [
+                ModelResponse(
+                    tool_calls=[
+                        ToolCall(id="c1", name="write_file", args={"path": str(file_one), "content": "1"}),
+                        ToolCall(id="c2", name="write_file", args={"path": str(file_two), "content": "2"}),
+                    ]
+                ),
+                ModelResponse(content="Ambos gravados."),
+            ]
+        )
+        agent = Agent(
+            model=provider,
+            instructions="sys",
+            auto_approve=False,
+            approval_callback=approve_all_cb,
+        )
+
+        reply = asyncio.run(agent.run("write two files"))
+        self.assertEqual(reply, "Ambos gravados.")
+        self.assertTrue(agent.auto_approve)
+        self.assertEqual(calls, ["write_file"])
+        self.assertEqual(file_one.read_text(encoding="utf-8"), "1")
+        self.assertEqual(file_two.read_text(encoding="utf-8"), "2")
+
+    def test_read_only_tools_skip_approval_callback_when_manual(self) -> None:
+        sample = self.root / "readme.txt"
+        sample.write_text("hello_hitl\n", encoding="utf-8")
+        callback_calls: list[str] = []
+
+        def spy_cb(tool_name: str, _args: dict[str, Any]) -> bool:
+            callback_calls.append(tool_name)
+            return False
+
+        provider = FakeProvider(
+            [
+                ModelResponse(
+                    tool_calls=[
+                        ToolCall(id="c_read", name="read_file", args={"path": str(sample)}),
+                        ToolCall(id="c_list", name="list_dir", args={"path": str(self.root)}),
+                    ]
+                ),
+                ModelResponse(content="Leitura feita."),
+            ]
+        )
+        agent = Agent(
+            model=provider,
+            instructions="sys",
+            auto_approve=False,
+            approval_callback=spy_cb,
+        )
+
+        reply = asyncio.run(agent.run("inspect workspace"))
+        self.assertEqual(reply, "Leitura feita.")
+        self.assertEqual(callback_calls, [])
+        tool_msgs = [m for m in agent.messages if m["role"] == "tool"]
+        self.assertIn("hello_hitl", tool_msgs[0]["content"])
+        self.assertIn("readme.txt", tool_msgs[1]["content"])
+
+    def test_custom_require_approval_gates_custom_tool(self) -> None:
+        executed: list[str] = []
+
+        def custom_deploy(env: str) -> str:
+            executed.append(env)
+            return f"deployed:{env}"
+
+        custom_schemas = [
+            {
+                "name": "deploy",
+                "description": "Deploy service",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"env": {"type": "string"}},
+                    "required": ["env"],
+                },
+            }
+        ]
+        provider = FakeProvider(
+            [
+                ModelResponse(tool_calls=[ToolCall(id="cd1", name="deploy", args={"env": "prod"})]),
+                ModelResponse(content="Deploy bloqueado pelo usuário."),
+            ]
+        )
+        agent = Agent(
+            model=provider,
+            instructions="sys",
+            tools={"deploy": custom_deploy},
+            tool_schemas=custom_schemas,
+            auto_approve=False,
+            require_approval={"deploy"},
+            approval_callback=lambda _name, _args: False,
+        )
+
+        reply = asyncio.run(agent.run("deploy prod"))
+        self.assertEqual(reply, "Deploy bloqueado pelo usuário.")
+        self.assertEqual(executed, [])
+        tool_msgs = [m for m in agent.messages if m["role"] == "tool"]
+        self.assertIn("recusada", tool_msgs[0]["content"].lower())
+
+    def test_fail_closed_when_manual_without_callback(self) -> None:
+        target = self.root / "no_cb.txt"
+        provider = FakeProvider(
+            [
+                ModelResponse(
+                    tool_calls=[
+                        ToolCall(id="c_nocb", name="write_file", args={"path": str(target), "content": "nope"})
+                    ]
+                ),
+                ModelResponse(content="Sem callback."),
+            ]
+        )
+        agent = Agent(
+            model=provider,
+            instructions="sys",
+            auto_approve=False,
+            approval_callback=None,
+        )
+
+        reply = asyncio.run(agent.run("write without callback"))
+        self.assertEqual(reply, "Sem callback.")
+        self.assertFalse(target.exists())
+        tool_msgs = [m for m in agent.messages if m["role"] == "tool"]
+        self.assertIn("recusada", tool_msgs[0]["content"].lower())
+
+    def test_guardrail_block_and_unknown_tool_short_circuit_before_approval_callback(self) -> None:
+        callback_calls: list[str] = []
+
+        def spy_cb(tool_name: str, _args: dict[str, Any]) -> bool:
+            callback_calls.append(tool_name)
+            return True
+
+        provider = FakeProvider(
+            [
+                ModelResponse(
+                    tool_calls=[
+                        ToolCall(
+                            id="c_env",
+                            name="write_file",
+                            args={"path": str(self.root / ".env"), "content": "SECRET=1"},
+                        ),
+                        ToolCall(id="c_bash", name="bash", args={"cmd": "git reset --hard"}),
+                        ToolCall(id="c_unk", name="does_not_exist", args={}),
+                    ]
+                ),
+                ModelResponse(content="Handled."),
+            ]
+        )
+        agent = Agent(
+            model=provider,
+            instructions="sys",
+            guardrails=[
+                PathSandboxingGuardrail(root_dir=self.root),
+                CommandSafetyGuardrail(),
+            ],
+            auto_approve=False,
+            require_approval={"write_file", "bash", "does_not_exist"},
+            approval_callback=spy_cb,
+        )
+
+        reply = asyncio.run(agent.run("blocked calls"))
+        self.assertEqual(reply, "Handled.")
+        self.assertEqual(callback_calls, [])
+        self.assertFalse((self.root / ".env").exists())
+
+    def test_keyboard_interrupt_during_approval_triggers_workspace_rollback(self) -> None:
+        repo = self.root / "repo"
+        repo.mkdir()
+        subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True)
+        subprocess.run(["git", "config", "user.name", "Test User"], cwd=repo, check=True)
+        app_file = repo / "app.py"
+        app_file.write_text("VALUE = 1\n", encoding="utf-8")
+        subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
+        subprocess.run(["git", "commit", "-m", "initial"], cwd=repo, check=True, capture_output=True)
+
+        decisions = [True]
+
+        def interrupt_on_second(_tool_name: str, _args: dict[str, Any]) -> bool:
+            if decisions:
+                return decisions.pop(0)
+            raise KeyboardInterrupt
+
+        provider = FakeProvider(
+            [
+                ModelResponse(
+                    tool_calls=[
+                        ToolCall(id="c1", name="write_file", args={"path": str(app_file), "content": "VALUE = 2\n"}),
+                        ToolCall(id="c2", name="bash", args={"cmd": "echo hi"}),
+                    ]
+                )
+            ]
+        )
+        agent = Agent(
+            model=provider,
+            instructions="sys",
+            checkpointing=True,
+            workspace_dir=repo,
+            auto_approve=False,
+            approval_callback=interrupt_on_second,
+        )
+
+        with self.assertRaises(KeyboardInterrupt):
+            asyncio.run(agent.run("edit then interrupt"))
+
+        self.assertEqual(app_file.read_text(encoding="utf-8"), "VALUE = 1\n")
+        self.assertIsNotNone(agent.last_rollback_message)
+
+    def test_cli_parse_args_auto_approve_flags(self) -> None:
+        self.assertFalse(main.parse_args([]).auto_approve)
+        self.assertTrue(main.parse_args(["--auto-approve"]).auto_approve)
+        self.assertTrue(main.parse_args(["-y"]).auto_approve)
+
+    def test_format_approval_prompt_tools_and_truncation(self) -> None:
+        bash_prompt = main.format_approval_prompt("bash", {"cmd": "line1\nline2\r\nline3"})
+        self.assertEqual(bash_prompt, "Executar [bash: 'line1 line2 line3']? (s/n/a): ")
+
+        long_bash = main.format_approval_prompt("bash", {"cmd": "x" * 30}, max_preview=15)
+        self.assertEqual(long_bash, "Executar [bash: 'xxxxxxxxxxxx...']? (s/n/a): ")
+
+        write_prompt = main.format_approval_prompt("write_file", {"path": "dir/a.py", "content": "hello"})
+        self.assertEqual(write_prompt, "Executar [write_file: 'dir/a.py' (5 chars)]? (s/n/a): ")
+
+        sr_prompt = main.format_approval_prompt(
+            "search_replace",
+            {"path": "dir/a.py", "search": "old", "replace": "new"},
+        )
+        self.assertEqual(sr_prompt, "Executar [search_replace: 'dir/a.py']? (s/n/a): ")
+
+        custom_prompt = main.format_approval_prompt("deploy", {"env": "prod", "force": True})
+        self.assertEqual(custom_prompt, "Executar [deploy: env=prod, force=True]? (s/n/a): ")
+
+    def test_parse_approval_response_tokens(self) -> None:
+        for token in ("s", "sim", "y", "yes", " S "):
+            decision = main.parse_approval_response(token)
+            self.assertEqual(decision, ApprovalDecision(ApprovalAction.APPROVE))
+
+        for token in ("n", "nao", "não", "no", "", "   "):
+            decision = main.parse_approval_response(token)
+            self.assertEqual(decision, ApprovalDecision(ApprovalAction.REJECT))
+
+        for token in ("a", "all", "sempre", "todos", " ALL "):
+            decision = main.parse_approval_response(token)
+            self.assertEqual(decision, ApprovalDecision(ApprovalAction.APPROVE_ALL))
+
+        for token in ("maybe", "x", "123"):
+            self.assertIsNone(main.parse_approval_response(token))
+
+    def test_prompt_tool_approval_reprompts_and_handles_eof(self) -> None:
+        buf = io.StringIO()
+        with mock.patch("builtins.input", side_effect=["invalid", "s"]), mock.patch("sys.stdout", buf):
+            decision = asyncio.run(main._prompt_tool_approval("bash", {"cmd": "echo ok"}))
+        self.assertEqual(decision, ApprovalDecision(ApprovalAction.APPROVE))
+        self.assertIn("Resposta inválida", buf.getvalue())
+
+        eof_buf = io.StringIO()
+        with mock.patch("builtins.input", side_effect=EOFError), mock.patch("sys.stdout", eof_buf):
+            eof_decision = asyncio.run(main._prompt_tool_approval("bash", {"cmd": "echo ok"}))
+        self.assertEqual(eof_decision, ApprovalDecision(ApprovalAction.REJECT))
+        self.assertIn("EOF", eof_buf.getvalue())
+
+    def test_handle_auto_approve_command_toggle_explicit_and_invalid(self) -> None:
+        agent = Agent(model=FakeProvider([]), auto_approve=False)
+        buf = io.StringIO()
+        with mock.patch("sys.stdout", buf):
+            main._handle_auto_approve_command("", agent)
+            self.assertTrue(agent.auto_approve)
+
+            main._handle_auto_approve_command("off", agent)
+            self.assertFalse(agent.auto_approve)
+
+            main._handle_auto_approve_command("on", agent)
+            self.assertTrue(agent.auto_approve)
+
+            main._handle_auto_approve_command("wat", agent)
+            self.assertTrue(agent.auto_approve)
+
+        out = buf.getvalue()
+        self.assertIn("ATIVADO", out)
+        self.assertIn("DESATIVADO", out)
+        self.assertIn("/auto-approve [on|off]", out)
 
 
 if __name__ == "__main__":

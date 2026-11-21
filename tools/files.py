@@ -65,6 +65,7 @@ FILE_TOOL_SPECS: tuple[ToolSpec, ...] = (
         },
         handler=tool_write_file,
         checks_path=True,
+        requires_approval=True,
     ),
     ToolSpec(
         name="search_replace",
@@ -83,5 +84,6 @@ FILE_TOOL_SPECS: tuple[ToolSpec, ...] = (
         },
         handler=tool_search_replace,
         checks_path=True,
+        requires_approval=True,
     ),
 )
