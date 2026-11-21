@@ -10,7 +10,8 @@ import unittest
 from typing import Any
 from unittest import mock
 
-from agent import Agent, tool_find_files, tool_grep, tool_list_dir
+from agent import Agent
+from tools import tool_find_files, tool_grep, tool_list_dir
 from guardrails import (
     BaseGuardrail,
     CommandSafetyGuardrail,

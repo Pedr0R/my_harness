@@ -1,67 +1,28 @@
 from __future__ import annotations
 
 import pathlib
-from typing import Any, Callable
+from typing import Any
 
 from guardrails.base import BaseGuardrail, GuardrailResult
-
-
-FILE_TOOLS: frozenset[str] = frozenset(
-    {"read_file", "write_file", "search_replace", "grep", "list_dir", "find_files"}
+from tools import DEFAULT_PATH_TOOLS, FILE_TOOLS
+from workspace import (
+    SENSITIVE_DIRS,
+    SENSITIVE_KEY_FILES,
+    SENSITIVE_KEY_SUFFIXES,
+    SENSITIVE_PATH_CHECKS,
+    is_sensitive_path,
 )
 
-DEFAULT_PATH_TOOLS: frozenset[str] = frozenset({"grep", "list_dir", "find_files"})
-
-SENSITIVE_DIRS: frozenset[str] = frozenset({".git", ".ssh", ".gnupg", ".aws"})
-
-SENSITIVE_KEY_FILES: frozenset[str] = frozenset(
-    {"id_rsa", "id_ed25519", "id_ecdsa", "id_dsa"}
-)
-
-SENSITIVE_KEY_SUFFIXES: frozenset[str] = frozenset({".pem", ".key"})
-
-
-def _check_sensitive_dir(rel_parts: tuple[str, ...], _filename: str, _suffix: str) -> str | None:
-    if any(part in SENSITIVE_DIRS for part in rel_parts):
-        return "Blocked by path sandbox (sensitive path)."
-    return None
-
-
-def _check_env_file(_rel_parts: tuple[str, ...], filename: str, _suffix: str) -> str | None:
-    if filename == ".env" or filename.startswith(".env."):
-        return "Blocked by path sandbox (sensitive path)."
-    return None
-
-
-def _check_private_key(_rel_parts: tuple[str, ...], filename: str, suffix: str) -> str | None:
-    if filename in SENSITIVE_KEY_FILES or suffix in SENSITIVE_KEY_SUFFIXES:
-        return "Blocked by path sandbox (sensitive path)."
-    return None
-
-
-SENSITIVE_PATH_CHECKS: tuple[Callable[[tuple[str, ...], str, str], str | None], ...] = (
-    _check_sensitive_dir,
-    _check_env_file,
-    _check_private_key,
-)
-
-
-def is_sensitive_path(resolved: pathlib.Path, root: pathlib.Path) -> str | None:
-    try:
-        rel = resolved.relative_to(root)
-    except ValueError:
-        return "Blocked by path sandbox (outside workspace)."
-
-    lower_parts = tuple(part.lower() for part in rel.parts)
-    lower_name = rel.name.lower()
-    lower_suffix = rel.suffix.lower()
-
-    for check in SENSITIVE_PATH_CHECKS:
-        reason = check(lower_parts, lower_name, lower_suffix)
-        if reason is not None:
-            return reason
-
-    return None
+__all__ = [
+    "DEFAULT_PATH_TOOLS",
+    "FILE_TOOLS",
+    "PathSandboxingGuardrail",
+    "SENSITIVE_DIRS",
+    "SENSITIVE_KEY_FILES",
+    "SENSITIVE_KEY_SUFFIXES",
+    "SENSITIVE_PATH_CHECKS",
+    "is_sensitive_path",
+]
 
 
 class PathSandboxingGuardrail(BaseGuardrail):

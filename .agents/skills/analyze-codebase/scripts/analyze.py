@@ -11,50 +11,42 @@ import unittest
 
 
 def check_tool_schema_parity(repo_root: Path) -> dict[str, any]:
-    """Verify that every tool in TOOLS has a matching definition in TOOL_SCHEMAS."""
-    agent_file = repo_root / "agent.py"
-    if not agent_file.exists():
-        return {"ok": False, "error": "agent.py not found"}
+    """Verify that every tool in tools.TOOLS has a matching definition in tools.TOOL_SCHEMAS."""
+    root_str = str(repo_root.resolve())
+    if root_str not in sys.path:
+        sys.path.insert(0, root_str)
 
     try:
-        tree = ast.parse(agent_file.read_text(encoding="utf-8"))
+        from tools import TOOL_SCHEMAS, TOOLS
     except Exception as exc:
-        return {"ok": False, "error": f"AST parse failed: {exc}"}
+        return {"ok": False, "error": f"Failed to import tools package: {exc}"}
 
-    tools_dict_keys: set[str] = set()
-    tool_schema_names: set[str] = set()
-
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Assign):
-            for target in node.targets:
-                if isinstance(target, ast.Name):
-                    if target.id == "TOOLS" and isinstance(node.value, ast.Dict):
-                        for k in node.value.keys:
-                            if isinstance(k, ast.Constant) and isinstance(k.value, str):
-                                tools_dict_keys.add(k.value)
-                    elif target.id == "TOOL_SCHEMAS" and isinstance(node.value, ast.List):
-                        for elt in node.value.elts:
-                            if isinstance(elt, ast.Dict):
-                                for k, v in zip(elt.keys, elt.values):
-                                    if (
-                                        isinstance(k, ast.Constant)
-                                        and k.value == "name"
-                                        and isinstance(v, ast.Constant)
-                                        and isinstance(v.value, str)
-                                    ):
-                                        tool_schema_names.add(v.value)
+    tools_dict_keys = set(TOOLS.keys())
+    schema_names_list = [s.get("name") for s in TOOL_SCHEMAS if isinstance(s, dict) and s.get("name")]
+    tool_schema_names = set(schema_names_list)
 
     missing_schemas = sorted(tools_dict_keys - tool_schema_names)
     missing_tools = sorted(tool_schema_names - tools_dict_keys)
-    is_parity = len(missing_schemas) == 0 and len(missing_tools) == 0
+    duplicate_schemas = len(schema_names_list) != len(tool_schema_names)
+    invalid_handlers = sorted(name for name, fn in TOOLS.items() if not callable(fn))
+
+    is_parity = (
+        len(missing_schemas) == 0
+        and len(missing_tools) == 0
+        and not duplicate_schemas
+        and len(invalid_handlers) == 0
+        and len(tools_dict_keys) > 0
+    )
 
     return {
         "ok": is_parity,
         "tools_count": len(tools_dict_keys),
         "tools": sorted(tools_dict_keys),
-        "schemas_count": len(tool_schema_names),
+        "schemas_count": len(schema_names_list),
         "missing_schemas": missing_schemas,
         "missing_tools": missing_tools,
+        "duplicate_schemas": duplicate_schemas,
+        "invalid_handlers": invalid_handlers,
     }
 
 

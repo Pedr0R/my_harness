@@ -1,19 +1,41 @@
 import argparse
 import asyncio
 from datetime import datetime
-import json
 import pathlib
 import re
 import sys
 from typing import Any
 
-from agent import Agent
+from agent import Agent, AgentLimitError
 from guardrails import GuardrailsConfig, build_guardrails
 from providers import get_provider
+from session import (
+    DEFAULT_SESSIONS_DIR,
+    SESSION_ID_RE,
+    generate_session_id,
+    list_saved_sessions,
+    resolve_session_path,
+    resolve_session_target,
+    restore_session_data as _restore_session_data,
+    validate_session_id,
+)
+from tools import TOOLS, TOOL_SCHEMAS
 
 
-DEFAULT_SESSIONS_DIR = ".sessions"
-SESSION_ID_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+__all__ = [
+    "DEFAULT_SESSIONS_DIR",
+    "GUARDRAIL_CHOICES",
+    "SESSION_ID_RE",
+    "build_guardrails_config",
+    "generate_session_id",
+    "list_saved_sessions",
+    "parse_args",
+    "resolve_session_path",
+    "resolve_session_target",
+    "terminal_chat",
+    "validate_session_id",
+]
+
 GUARDRAIL_CHOICES = (
     "path_sandboxing",
     "command_safety",
@@ -22,38 +44,7 @@ GUARDRAIL_CHOICES = (
     "all",
 )
 
-
-def validate_session_id(raw_id: str) -> str:
-    """Valida e normaliza um identificador de sessão, bloqueando path traversal."""
-    cleaned = raw_id.strip()
-    if cleaned.lower().endswith(".json"):
-        cleaned = cleaned[:-5]
-    if not cleaned or ".." in cleaned or not SESSION_ID_RE.match(cleaned):
-        raise ValueError(
-            f"Identificador de sessão inválido: {raw_id!r}. "
-            "Use apenas letras, números, '.', '_' ou '-'."
-        )
-    return cleaned
-
-
-def resolve_session_path(sessions_dir: pathlib.Path, raw_id: str) -> tuple[str, pathlib.Path]:
-    """Resolve o caminho seguro <sessions_dir>/<session_id>.json."""
-    session_id = validate_session_id(raw_id)
-    base_dir = sessions_dir.resolve()
-    target = (base_dir / f"{session_id}.json").resolve()
-    if target.parent != base_dir:
-        raise ValueError(f"Caminho de sessão fora do diretório permitido: {raw_id!r}")
-    return session_id, target
-
-
-def resolve_session_target(sessions_dir: pathlib.Path, raw_id: str) -> tuple[str, pathlib.Path]:
-    """Resolve um ID de sessão ou o atalho 'last' para a sessão válida mais recente."""
-    if raw_id.strip().lower() == "last":
-        valid_sessions = [entry for entry in list_saved_sessions(sessions_dir) if entry["valid"]]
-        if not valid_sessions:
-            raise FileNotFoundError(f"Nenhuma sessão salva encontrada em {sessions_dir}.")
-        return resolve_session_path(sessions_dir, valid_sessions[0]["session_id"])
-    return resolve_session_path(sessions_dir, raw_id)
+EXIT_COMMANDS = frozenset({"exit", "sair", "quit", "q"})
 
 
 def _format_provider_error(exc: Exception) -> str:
@@ -69,74 +60,6 @@ def _format_provider_error(exc: Exception) -> str:
         return f"[Limite de requisições da API (429)]: cota temporariamente excedida.{hint}"
     first_line = text.splitlines()[0].strip() if text else type(exc).__name__
     return f"[Erro ao consultar o provedor]: {type(exc).__name__}: {first_line}"
-
-
-def generate_session_id(sessions_dir: pathlib.Path) -> str:
-    """Gera um ID único no formato session_YYYYMMDD_HHMMSS sem sobrescrever sessões existentes."""
-    base = datetime.now().strftime("session_%Y%m%d_%H%M%S")
-    candidate = base
-    suffix = 1
-    while (sessions_dir / f"{candidate}.json").exists():
-        candidate = f"{base}_{suffix}"
-        suffix += 1
-    return candidate
-
-
-def list_saved_sessions(sessions_dir: pathlib.Path) -> list[dict[str, Any]]:
-    """Lista arquivos de sessão salvos ordenados do mais recente para o mais antigo."""
-    if not sessions_dir.is_dir():
-        return []
-
-    entries: list[tuple[float, dict[str, Any]]] = []
-    for path in sessions_dir.glob("*.json"):
-        mtime = path.stat().st_mtime
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-            if not isinstance(data, dict):
-                raise ValueError("JSON raiz não é um objeto")
-            history = data.get("history", [])
-            interactions = len(history) // 2 if isinstance(history, list) else 0
-            entries.append(
-                (
-                    mtime,
-                    {
-                        "session_id": str(data.get("session_id") or path.stem),
-                        "updated_at": str(data.get("updated_at") or data.get("started_at") or ""),
-                        "n_turns": data.get("n_turns", 0),
-                        "interactions": interactions,
-                        "valid": True,
-                    },
-                )
-            )
-        except Exception:
-            entries.append(
-                (
-                    mtime,
-                    {
-                        "session_id": path.stem,
-                        "updated_at": "",
-                        "n_turns": 0,
-                        "interactions": 0,
-                        "valid": False,
-                    },
-                )
-            )
-
-    entries.sort(key=lambda item: (item[1]["updated_at"], item[0]), reverse=True)
-    return [item[1] for item in entries]
-
-
-def _restore_session_data(data: dict[str, Any], fallback_id: str) -> dict[str, Any]:
-    """Reconstrói session_data a partir do JSON carregado de disco."""
-    now_iso = datetime.now().isoformat()
-    raw_history = data.get("history", [])
-    history = list(raw_history) if isinstance(raw_history, list) else []
-    return {
-        "session_id": str(data.get("session_id") or fallback_id),
-        "started_at": str(data.get("started_at") or now_iso),
-        "updated_at": str(data.get("updated_at") or now_iso),
-        "history": history,
-    }
 
 
 def build_guardrails_config(disabled_guardrails: list[str] | None = None) -> GuardrailsConfig:
@@ -169,6 +92,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help=f"Diretório de armazenamento das sessões (padrão: {DEFAULT_SESSIONS_DIR}).",
     )
     parser.add_argument(
+        "--provider",
+        default=None,
+        help="Provedor de modelo (ex.: gemini, grok, openai, deepseek, ollama).",
+    )
+    parser.add_argument(
+        "--model",
+        default=None,
+        help="Nome do modelo a ser utilizado pelo provedor.",
+    )
+    parser.add_argument(
         "--disable-guardrail",
         action="append",
         choices=GUARDRAIL_CHOICES,
@@ -185,13 +118,97 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def _print_banner(resumed: bool, session_data: dict[str, Any], agent: Agent) -> None:
+    print("=" * 60)
+    print("🤖 Chat Interativo com SWE-Agent")
+    print("Comandos: digite 'exit' ou 'sair' para encerrar a conversa.")
+    print("          digite 'memory' para visualizar a memória da sessão.")
+    print("          digite '/load <session_id|last>' para carregar uma sessão salva.")
+    print("          digite '/sessions' para listar as sessões salvas.")
+    print("          digite '/undo' para desfazer as alterações do último turno.")
+    if resumed:
+        interactions = len(session_data["history"]) // 2
+        print(
+            f"Sessão retomada: {session_data['session_id']} "
+            f"({interactions} interações, {agent.n_turns} turnos internos)"
+        )
+    print("=" * 60 + "\n")
+
+
+def _print_saved_sessions(sessions_path: pathlib.Path) -> None:
+    saved = list_saved_sessions(sessions_path)
+    print("\n[Sessões Salvas]:")
+    if not saved:
+        print(f"  Nenhuma sessão encontrada em {sessions_path}.")
+    else:
+        for entry in saved:
+            if entry["valid"]:
+                print(
+                    f"  - {entry['session_id']} | "
+                    f"interações: {entry['interactions']} | "
+                    f"turnos: {entry['n_turns']} | "
+                    f"atualizado em: {entry['updated_at']}"
+                )
+            else:
+                print(f"  - {entry['session_id']} [arquivo inválido/corrompido]")
+    print("-" * 60 + "\n")
+
+
+def _print_session_memory(session_data: dict[str, Any], agent: Agent) -> None:
+    print("\n[Memória da Sessão Atual]:")
+    print(f"Sessão: {session_data['session_id']}")
+    print(f"Total de turnos internos: {agent.n_turns}")
+    print(f"Custo estimado: ${agent.cost:.4f}")
+    print(f"Total de mensagens gravadas: {len(session_data['history'])}")
+    for item in session_data["history"]:
+        print(f"  - [{item['timestamp']}] {item['speaker'].upper()}: {item['text'][:80]}...")
+    print("-" * 60 + "\n")
+
+
+def _handle_undo_command(agent: Agent) -> None:
+    result = agent.undo_last_turn()
+    if result.ok:
+        print(f"\n[Rollback]: {result.message}")
+    else:
+        print(f"\n[Rollback indisponível]: {result.message}")
+    print("-" * 60 + "\n")
+
+
+def _handle_load_command(
+    raw_target: str,
+    sessions_path: pathlib.Path,
+    agent: Agent,
+) -> tuple[dict[str, Any], pathlib.Path] | None:
+    if not raw_target:
+        print("\n[Uso]: /load <session_id|last> (digite '/sessions' para listar)\n")
+        return None
+    try:
+        validated_id, target_file = resolve_session_target(sessions_path, raw_target)
+        loaded = agent.load_from_file(target_file)
+        restored_data = _restore_session_data(loaded, fallback_id=validated_id)
+        interactions = len(restored_data["history"]) // 2
+        print(
+            f"\n[Sessão carregada]: {restored_data['session_id']} "
+            f"(interações: {interactions}, turnos internos: {agent.n_turns}, "
+            f"custo: ${agent.cost:.4f})"
+        )
+        print("-" * 60 + "\n")
+        return restored_data, target_file
+    except (FileNotFoundError, ValueError) as exc:
+        print(f"\n[Erro ao carregar sessão]: {exc}\n")
+        return None
+
+
 async def terminal_chat(
     session_id: str | None = None,
     sessions_dir: str | pathlib.Path = DEFAULT_SESSIONS_DIR,
     disabled_guardrails: list[str] | None = None,
     checkpointing: bool = True,
+    provider_name: str | None = None,
+    model_name: str | None = None,
 ) -> dict[str, Any]:
-    provider = get_provider("gemini", model="gemini-3.5-flash-lite")
+    provider_kwargs: dict[str, Any] = {"model": model_name} if model_name else {}
+    provider = get_provider(provider_name, **provider_kwargs)
     guardrails_config = build_guardrails_config(disabled_guardrails)
     agent = Agent(
         name="SWE-Agent",
@@ -201,6 +218,8 @@ async def terminal_chat(
             "Mantenha o contexto das mensagens anteriores."
         ),
         guardrails=build_guardrails(guardrails_config),
+        tools=TOOLS,
+        tool_schemas=TOOL_SCHEMAS,
         checkpointing=checkpointing,
     )
 
@@ -224,7 +243,7 @@ async def terminal_chat(
             "session_id": new_id,
             "started_at": now_iso,
             "updated_at": now_iso,
-            "history": [],  # Array com o log de cada interação usuário/agente
+            "history": [],
         }
 
     persisted_file: pathlib.Path | None = current_file if resumed else None
@@ -243,120 +262,53 @@ async def terminal_chat(
         )
         return persisted_file
 
-    print("=" * 60)
-    print("🤖 Chat Interativo com SWE-Agent")
-    print("Comandos: digite 'exit' ou 'sair' para encerrar a conversa.")
-    print("          digite 'memory' para visualizar a memória da sessão.")
-    print("          digite '/load <session_id|last>' para carregar uma sessão salva.")
-    print("          digite '/sessions' para listar as sessões salvas.")
-    print("          digite '/undo' para desfazer as alterações do último turno.")
-    if resumed:
-        interactions = len(session_data["history"]) // 2
-        print(
-            f"Sessão retomada: {session_data['session_id']} "
-            f"({interactions} interações, {agent.n_turns} turnos internos)"
-        )
-    print("=" * 60 + "\n")
+    _print_banner(resumed, session_data, agent)
 
     while True:
         try:
-            # Executa a captura do input do usuário sem travar o loop de eventos
             user_input = await asyncio.to_thread(input, "Você: ")
             user_input = user_input.strip()
         except (KeyboardInterrupt, EOFError):
             print("\nEncerrando sessão via interrupção...")
             break
 
-        # Ignora mensagens vazias
         if not user_input:
             continue
 
         lower_cmd = user_input.lower()
-
-        # Comando simples de saída
-        if lower_cmd in ("exit", "sair", "quit", "q"):
+        if lower_cmd in EXIT_COMMANDS:
             print("\nEncerrando conversa...")
             break
-
-        # Comando para listar sessões salvas
         if lower_cmd == "/sessions":
-            saved = list_saved_sessions(sessions_path)
-            print("\n[Sessões Salvas]:")
-            if not saved:
-                print(f"  Nenhuma sessão encontrada em {sessions_path}.")
-            else:
-                for entry in saved:
-                    if entry["valid"]:
-                        print(
-                            f"  - {entry['session_id']} | "
-                            f"interações: {entry['interactions']} | "
-                            f"turnos: {entry['n_turns']} | "
-                            f"atualizado em: {entry['updated_at']}"
-                        )
-                    else:
-                        print(f"  - {entry['session_id']} [arquivo inválido/corrompido]")
-            print("-" * 60 + "\n")
+            _print_saved_sessions(sessions_path)
             continue
-
-        # Comando para carregar outra sessão em tempo de execução
         if lower_cmd == "/load" or lower_cmd.startswith("/load "):
-            target_raw = user_input[5:].strip()
-            if not target_raw:
-                print("\n[Uso]: /load <session_id|last> (digite '/sessions' para listar)\n")
-                continue
-            try:
-                validated_id, target_file = resolve_session_target(sessions_path, target_raw)
-                loaded = agent.load_from_file(target_file)
-                session_data = _restore_session_data(loaded, fallback_id=validated_id)
-                current_file = target_file
-                persisted_file = target_file
-                interactions = len(session_data["history"]) // 2
-                print(
-                    f"\n[Sessão carregada]: {session_data['session_id']} "
-                    f"(interações: {interactions}, turnos internos: {agent.n_turns}, "
-                    f"custo: ${agent.cost:.4f})"
-                )
-                print("-" * 60 + "\n")
-            except (FileNotFoundError, ValueError) as exc:
-                print(f"\n[Erro ao carregar sessão]: {exc}\n")
+            loaded_result = _handle_load_command(user_input[5:].strip(), sessions_path, agent)
+            if loaded_result is not None:
+                session_data, current_file = loaded_result
+                persisted_file = current_file
             continue
-
-        # Comando para desfazer alterações do último turno no workspace
         if lower_cmd in ("/undo", "/rollback"):
-            result = agent.undo_last_turn()
-            if result.ok:
-                print(f"\n[Rollback]: {result.message}")
-            else:
-                print(f"\n[Rollback indisponível]: {result.message}")
-            print("-" * 60 + "\n")
+            _handle_undo_command(agent)
             continue
-
-        # Comando extra para visualizar a memória atual da sessão
         if lower_cmd == "memory":
-            print("\n[Memória da Sessão Atual]:")
-            print(f"Sessão: {session_data['session_id']}")
-            print(f"Total de turnos internos: {agent.n_turns}")
-            print(f"Custo estimado: ${agent.cost:.4f}")
-            print(f"Total de mensagens gravadas: {len(session_data['history'])}")
-            for item in session_data["history"]:
-                print(f"  - [{item['timestamp']}] {item['speaker'].upper()}: {item['text'][:80]}...")
-            print("-" * 60 + "\n")
+            _print_session_memory(session_data, agent)
             continue
 
-        # Registra a entrada do usuário no array da sessão (com rollback caso o turno falhe antes de responder)
         prev_msg_count = len(agent.messages)
         prev_turns = agent.n_turns
-        user_turn = {
-            "speaker": "user",
-            "text": user_input,
-            "timestamp": datetime.now().isoformat(),
-        }
-        session_data["history"].append(user_turn)
+        session_data["history"].append(
+            {
+                "speaker": "user",
+                "text": user_input,
+                "timestamp": datetime.now().isoformat(),
+            }
+        )
 
         print("\n[Agente pensando...]")
         try:
             response = await agent.run(user_input)
-        except StopIteration as exc:
+        except (AgentLimitError, StopIteration) as exc:
             persist_session()
             print(f"\n[Limite atingido]: {exc}\n")
             continue
@@ -383,21 +335,18 @@ async def terminal_chat(
             print("-" * 60)
             continue
 
-        # Registra a resposta do agente no array da sessão
-        agent_turn = {
-            "speaker": "agent",
-            "text": response,
-            "timestamp": datetime.now().isoformat(),
-        }
-        session_data["history"].append(agent_turn)
-
-        # Salvamento contínuo após cada turno concluído
+        session_data["history"].append(
+            {
+                "speaker": "agent",
+                "text": response,
+                "timestamp": datetime.now().isoformat(),
+            }
+        )
         persist_session()
 
         print(f"\nAgente: {response}\n")
         print("-" * 60)
 
-    # Ao sair, atualiza o resumo final no dicionário da sessão e persiste se houver histórico
     session_data["ended_at"] = datetime.now().isoformat()
     session_data["total_interactions"] = len(session_data["history"]) // 2
     if session_data["history"] or persisted_file is not None:
@@ -422,5 +371,7 @@ if __name__ == "__main__":
             sessions_dir=cli_args.sessions_dir,
             disabled_guardrails=cli_args.disable_guardrail,
             checkpointing=cli_args.checkpointing,
+            provider_name=cli_args.provider,
+            model_name=cli_args.model,
         )
     )
