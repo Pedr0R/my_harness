@@ -6,7 +6,7 @@ import re
 import sys
 from typing import Any
 
-from agent import Agent, AgentLimitError
+from agent import Agent, AgentLimitError, ApprovalAction, ApprovalDecision
 from guardrails import GuardrailsConfig, build_guardrails
 from providers import get_provider
 from session import (
@@ -27,8 +27,10 @@ __all__ = [
     "GUARDRAIL_CHOICES",
     "SESSION_ID_RE",
     "build_guardrails_config",
+    "format_approval_prompt",
     "generate_session_id",
     "list_saved_sessions",
+    "parse_approval_response",
     "parse_args",
     "resolve_session_path",
     "resolve_session_target",
@@ -45,6 +47,92 @@ GUARDRAIL_CHOICES = (
 )
 
 EXIT_COMMANDS = frozenset({"exit", "sair", "quit", "q"})
+
+_APPROVAL_RESPONSE_MAP: dict[str, ApprovalAction] = {
+    "": ApprovalAction.REJECT,
+    "n": ApprovalAction.REJECT,
+    "nao": ApprovalAction.REJECT,
+    "não": ApprovalAction.REJECT,
+    "no": ApprovalAction.REJECT,
+    "s": ApprovalAction.APPROVE,
+    "sim": ApprovalAction.APPROVE,
+    "y": ApprovalAction.APPROVE,
+    "yes": ApprovalAction.APPROVE,
+    "a": ApprovalAction.APPROVE_ALL,
+    "all": ApprovalAction.APPROVE_ALL,
+    "sempre": ApprovalAction.APPROVE_ALL,
+    "todos": ApprovalAction.APPROVE_ALL,
+}
+
+_AUTO_APPROVE_VALUES: dict[str, bool] = {
+    "on": True,
+    "true": True,
+    "s": True,
+    "sim": True,
+    "1": True,
+    "off": False,
+    "false": False,
+    "n": False,
+    "nao": False,
+    "não": False,
+    "0": False,
+}
+
+
+def _format_preview(value: Any, max_preview: int = 120) -> str:
+    cleaned = str(value).replace("\r\n", " ").replace("\r", " ").replace("\n", " ")
+    if len(cleaned) <= max_preview:
+        return cleaned
+    if max_preview <= 3:
+        return cleaned[:max_preview] + "..."
+    return cleaned[: max_preview - 3] + "..."
+
+
+def format_approval_prompt(
+    tool_name: str,
+    args: dict[str, Any],
+    max_preview: int = 120,
+) -> str:
+    """Formata o resumo da chamada de ferramenta para confirmação interativa no terminal."""
+    if tool_name == "bash":
+        preview = _format_preview(args.get("cmd", ""), max_preview)
+        return f"Executar [bash: '{preview}']? (s/n/a): "
+    if tool_name == "write_file":
+        path_preview = _format_preview(args.get("path", ""), max_preview)
+        raw_content = args.get("content", "")
+        content_len = len(raw_content) if isinstance(raw_content, str) else len(str(raw_content))
+        return f"Executar [write_file: '{path_preview}' ({content_len} chars)]? (s/n/a): "
+    if tool_name == "search_replace":
+        path_preview = _format_preview(args.get("path", ""), max_preview)
+        return f"Executar [search_replace: '{path_preview}']? (s/n/a): "
+
+    pairs = ", ".join(f"{k}={_format_preview(v, max_preview)}" for k, v in args.items())
+    preview = _format_preview(pairs, max_preview)
+    return f"Executar [{tool_name}: {preview}]? (s/n/a): "
+
+
+def parse_approval_response(raw: str) -> ApprovalDecision | None:
+    """Interpreta a resposta do usuário ('s'/'n'/'a') em ApprovalDecision ou None se inválida."""
+    action = _APPROVAL_RESPONSE_MAP.get(raw.strip().lower())
+    if action is None:
+        return None
+    return ApprovalDecision(action=action)
+
+
+async def _prompt_tool_approval(tool_name: str, args: dict[str, Any]) -> ApprovalDecision:
+    """Solicita confirmação humana no terminal sem bloquear o event loop."""
+    prompt = format_approval_prompt(tool_name, args)
+    while True:
+        try:
+            raw = await asyncio.to_thread(input, f"\n[Aprovação] {prompt}")
+        except EOFError:
+            print("\n[Aprovação]: entrada encerrada (EOF); ação recusada.")
+            return ApprovalDecision(ApprovalAction.REJECT)
+
+        decision = parse_approval_response(raw)
+        if decision is not None:
+            return decision
+        print("Resposta inválida. Digite 's' (sim), 'n' (não) ou 'a' (aprovar todas na sessão).")
 
 
 def _format_provider_error(exc: Exception) -> str:
@@ -115,6 +203,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=True,
         help="Desabilita checkpoint automático de workspace e rollback em caso de falha.",
     )
+    parser.add_argument(
+        "-y",
+        "--auto-approve",
+        dest="auto_approve",
+        action="store_true",
+        default=False,
+        help="Aprova automaticamente chamadas de ferramentas sem pedir confirmação interativa.",
+    )
     return parser.parse_args(argv)
 
 
@@ -126,6 +222,9 @@ def _print_banner(resumed: bool, session_data: dict[str, Any], agent: Agent) -> 
     print("          digite '/load <session_id|last>' para carregar uma sessão salva.")
     print("          digite '/sessions' para listar as sessões salvas.")
     print("          digite '/undo' para desfazer as alterações do último turno.")
+    print("          digite '/auto-approve [on|off]' para alternar aprovação automática.")
+    if agent.auto_approve:
+        print("Modo auto-approve ativo: ferramentas serão aprovadas automaticamente.")
     if resumed:
         interactions = len(session_data["history"]) // 2
         print(
@@ -174,6 +273,21 @@ def _handle_undo_command(agent: Agent) -> None:
     print("-" * 60 + "\n")
 
 
+def _handle_auto_approve_command(raw_arg: str, agent: Agent) -> None:
+    arg = raw_arg.strip().lower()
+    if not arg:
+        agent.auto_approve = not agent.auto_approve
+    elif arg in _AUTO_APPROVE_VALUES:
+        agent.auto_approve = _AUTO_APPROVE_VALUES[arg]
+    else:
+        print("\n[Uso]: /auto-approve [on|off]\n")
+        return
+
+    status = "ATIVADO (aprovação automática)" if agent.auto_approve else "DESATIVADO (confirmação manual)"
+    print(f"\n[Auto-approve]: {status}")
+    print("-" * 60 + "\n")
+
+
 def _handle_load_command(
     raw_target: str,
     sessions_path: pathlib.Path,
@@ -206,6 +320,7 @@ async def terminal_chat(
     checkpointing: bool = True,
     provider_name: str | None = None,
     model_name: str | None = None,
+    auto_approve: bool = False,
 ) -> dict[str, Any]:
     provider_kwargs: dict[str, Any] = {"model": model_name} if model_name else {}
     provider = get_provider(provider_name, **provider_kwargs)
@@ -221,6 +336,8 @@ async def terminal_chat(
         tools=TOOLS,
         tool_schemas=TOOL_SCHEMAS,
         checkpointing=checkpointing,
+        auto_approve=auto_approve,
+        approval_callback=_prompt_tool_approval,
     )
 
     sessions_path = pathlib.Path(sessions_dir)
@@ -290,6 +407,9 @@ async def terminal_chat(
             continue
         if lower_cmd in ("/undo", "/rollback"):
             _handle_undo_command(agent)
+            continue
+        if lower_cmd == "/auto-approve" or lower_cmd.startswith("/auto-approve "):
+            _handle_auto_approve_command(user_input[len("/auto-approve") :].strip(), agent)
             continue
         if lower_cmd == "memory":
             _print_session_memory(session_data, agent)
@@ -373,5 +493,6 @@ if __name__ == "__main__":
             checkpointing=cli_args.checkpointing,
             provider_name=cli_args.provider,
             model_name=cli_args.model,
+            auto_approve=cli_args.auto_approve,
         )
     )

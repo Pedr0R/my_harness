@@ -16,6 +16,7 @@ Um harness leve e modular para agentes autônomos de software (SWE Agents) em Py
 - **Chat Interativo no Terminal**: Conversação contínua com histórico e memória em array/dicionário.
 - **Persistência de Sessões**: Salvamento automático após cada turno em `.sessions/<session_id>.json` e retomada via CLI (`--session`) ou comando `/load`.
 - **Guardrails de Segurança**: Sandboxing de caminhos (`read_file`/`write_file`/`search_replace`/`grep`/`list_dir`/`find_files`), bloqueio de comandos destrutivos no `bash`, redação automática de segredos (`[REDACTED]`) e detecção de loops de ferramentas.
+- **Confirmação Humana (HitL)**: Aprovação interativa antes de executar chamadas com efeito colateral (`bash`, `write_file`, `search_replace`), com suporte a aprovar a sessão (`a`), flag `--auto-approve` (`-y`) e comando `/auto-approve`.
 - **Checkpoint de Workspace e Rollback Automático**: Snapshots isolados via Git (`GIT_INDEX_FILE` temporário, sem poluir `git stash` ou `.git/index`), rollback automático em caso de falha/interrupção no meio do turno e comando manual `/undo` (ou `/rollback`), preservando `.sessions/` e alterações prévias do usuário.
 - **Compactação de Contexto**: Redução automática de mensagens para evitar estourar a janela de contexto.
 
@@ -84,6 +85,7 @@ python main.py --provider ollama --model llama3.2
 python main.py --disable-guardrail loop_detection
 python main.py --disable-guardrail all
 python main.py --no-checkpoint
+python main.py --auto-approve
 ```
 
 Também é possível controlar cada guardrail via variáveis de ambiente (`GUARDRAIL_PATH_SANDBOXING`, `GUARDRAIL_COMMAND_SAFETY`, `GUARDRAIL_SECRETS_REDACTION`, `GUARDRAIL_LOOP_DETECTION`) com `true`/`false`.
@@ -112,6 +114,7 @@ O workflow de CI no GitHub Actions (`.github/workflows/ci.yml`) executa automati
 - `/sessions`: Lista as sessões salvas em `.sessions/`.
 - `/load <session_id|last>`: Carrega uma sessão existente (ou `last` para a mais recente) sem reiniciar o terminal.
 - `/undo` (ou `/rollback`): Desfaz as alterações de arquivos realizadas pelo último turno concluído usando o checkpoint mais recente.
+- `/auto-approve [on|off]`: Ativa, desativa ou alterna a aprovação automática de chamadas de ferramentas na sessão atual.
 
 ---
 
