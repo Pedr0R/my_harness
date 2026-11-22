@@ -1221,5 +1221,100 @@ class TestAgentStreaming(unittest.TestCase):
         self.assertIn("Workspace restaurado", agent.last_rollback_message or "")
 
 
+class TestTerminalStreamRenderer(unittest.TestCase):
+    def test_cli_parse_args_no_stream_flag(self) -> None:
+        self.assertTrue(main.parse_args([]).streaming)
+        self.assertFalse(main.parse_args(["--no-stream"]).streaming)
+
+    def test_renderer_streams_tokens_pauses_for_tool_and_resumes(self) -> None:
+        class _TrackingBuffer(io.StringIO):
+            def __init__(self) -> None:
+                super().__init__()
+                self.flush_count = 0
+
+            def flush(self) -> None:
+                self.flush_count += 1
+                super().flush()
+
+        buf = _TrackingBuffer()
+        renderer = main.TerminalStreamRenderer(stream=buf)
+
+        events = [
+            AgentEvent(type=EventType.TOKEN, text="Vou "),
+            AgentEvent(type=EventType.TOKEN, text="verificar."),
+            AgentEvent(
+                type=EventType.TOOL_START,
+                tool_name="read_file",
+                tool_args={"path": "app.py"},
+                tool_call_id="c1",
+            ),
+            AgentEvent(
+                type=EventType.TOOL_END,
+                tool_name="read_file",
+                tool_output="   1: VALUE = 1\n   2: VALUE = 2",
+                tool_call_id="c1",
+            ),
+            AgentEvent(type=EventType.TOKEN, text="Tudo "),
+            AgentEvent(type=EventType.TOKEN, text="certo!"),
+            AgentEvent(type=EventType.FINAL, text="Tudo certo!"),
+        ]
+        for ev in events:
+            renderer.handle(ev)
+
+        output = buf.getvalue()
+        self.assertEqual(renderer.final_text, "Tudo certo!")
+        self.assertGreaterEqual(buf.flush_count, len(events))
+        self.assertIn("\nAgente: Vou verificar.\n", output)
+        self.assertIn("[Executando ferramenta]: read_file (app.py)\n", output)
+        self.assertIn("[Ferramenta concluída]: read_file ->    1: VALUE = 1\n", output)
+        self.assertIn("\nTudo certo!\n", output)
+
+    def test_renderer_tool_first_then_tokens_prints_agente_prefix(self) -> None:
+        buf = io.StringIO()
+        renderer = main.TerminalStreamRenderer(stream=buf)
+
+        for ev in [
+            AgentEvent(
+                type=EventType.TOOL_START,
+                tool_name="bash",
+                tool_args={"cmd": "echo hi"},
+                tool_call_id="c1",
+            ),
+            AgentEvent(
+                type=EventType.TOOL_END,
+                tool_name="bash",
+                tool_output="exit=0\nstdout:\nhi",
+                tool_call_id="c1",
+            ),
+            AgentEvent(type=EventType.TOKEN, text="Pronto."),
+            AgentEvent(type=EventType.FINAL, text="Pronto."),
+        ]:
+            renderer.handle(ev)
+
+        output = buf.getvalue()
+        self.assertIn("[Executando ferramenta]: bash (echo hi)\n", output)
+        self.assertIn("[Ferramenta concluída]: bash -> exit=0\n", output)
+        self.assertIn("\nAgente: Pronto.\n", output)
+
+    def test_renderer_handles_final_without_preceding_tokens(self) -> None:
+        buf = io.StringIO()
+        renderer = main.TerminalStreamRenderer(stream=buf)
+
+        renderer.handle(AgentEvent(type=EventType.FINAL, text="Resposta única."))
+
+        self.assertEqual(renderer.final_text, "Resposta única.")
+        self.assertEqual(buf.getvalue(), "\nAgente: Resposta única.\n")
+
+    def test_renderer_finish_on_interrupt_closes_open_text_line_idempotently(self) -> None:
+        buf = io.StringIO()
+        renderer = main.TerminalStreamRenderer(stream=buf)
+
+        renderer.handle(AgentEvent(type=EventType.TOKEN, text="Parcial"))
+        renderer.finish_on_interrupt()
+        renderer.finish_on_interrupt()
+
+        self.assertEqual(buf.getvalue(), "\nAgente: Parcial\n")
+
+
 if __name__ == "__main__":
     unittest.main()

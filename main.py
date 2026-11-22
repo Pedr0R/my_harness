@@ -1,12 +1,13 @@
 import argparse
 import asyncio
+import contextlib
 from datetime import datetime
 import pathlib
 import re
 import sys
-from typing import Any
+from typing import Any, TextIO
 
-from agent import Agent, AgentLimitError, ApprovalAction, ApprovalDecision
+from agent import Agent, AgentEvent, AgentLimitError, ApprovalAction, ApprovalDecision, EventType
 from guardrails import GuardrailsConfig, build_guardrails
 from providers import get_provider
 from session import (
@@ -26,6 +27,7 @@ __all__ = [
     "DEFAULT_SESSIONS_DIR",
     "GUARDRAIL_CHOICES",
     "SESSION_ID_RE",
+    "TerminalStreamRenderer",
     "build_guardrails_config",
     "format_approval_prompt",
     "generate_session_id",
@@ -86,6 +88,79 @@ def _format_preview(value: Any, max_preview: int = 120) -> str:
     if max_preview <= 3:
         return cleaned[:max_preview] + "..."
     return cleaned[: max_preview - 3] + "..."
+
+
+def _format_tool_event_args(tool_name: str, args: dict[str, Any], max_preview: int = 80) -> str:
+    if tool_name == "bash":
+        return _format_preview(args.get("cmd", ""), max_preview)
+    if tool_name in ("write_file", "search_replace", "read_file"):
+        return _format_preview(args.get("path", ""), max_preview)
+    pairs = ", ".join(f"{k}={_format_preview(v, max_preview)}" for k, v in args.items())
+    return _format_preview(pairs, max_preview)
+
+
+class TerminalStreamRenderer:
+    """Renderiza eventos de Agent.run_stream em tempo real no terminal."""
+
+    def __init__(self, stream: TextIO | None = None, max_preview: int = 80) -> None:
+        self._stream: TextIO = stream if stream is not None else sys.stdout
+        self._max_preview = max_preview
+        self._in_text_block = False
+        self._has_rendered_prefix = False
+        self.final_text = ""
+
+    def _write(self, text: str) -> None:
+        self._stream.write(text)
+        self._stream.flush()
+
+    def handle(self, event: AgentEvent) -> None:
+        if event.type is EventType.TOKEN:
+            if not event.text:
+                return
+            if not self._in_text_block:
+                prefix = "\nAgente: " if not self._has_rendered_prefix else "\n"
+                self._write(prefix)
+                self._has_rendered_prefix = True
+                self._in_text_block = True
+            self._write(event.text)
+            return
+
+        if event.type is EventType.TOOL_START:
+            if self._in_text_block:
+                self._write("\n")
+                self._in_text_block = False
+            tool_name = event.tool_name or "ferramenta"
+            summary = _format_tool_event_args(
+                tool_name,
+                event.tool_args or {},
+                max_preview=self._max_preview,
+            )
+            detail = f" ({summary})" if summary else ""
+            self._write(f"\n[Executando ferramenta]: {tool_name}{detail}\n")
+            return
+
+        if event.type is EventType.TOOL_END:
+            tool_name = event.tool_name or "ferramenta"
+            raw_lines = (event.tool_output or "").splitlines()
+            first_line = raw_lines[0] if raw_lines else ""
+            preview = _format_preview(first_line, self._max_preview) if first_line else "ok"
+            self._write(f"[Ferramenta concluída]: {tool_name} -> {preview}\n")
+            return
+
+        if event.type is EventType.FINAL:
+            self.final_text = event.text
+            if self._in_text_block:
+                self._write("\n")
+                self._in_text_block = False
+            elif not self._has_rendered_prefix and event.text:
+                self._write(f"\nAgente: {event.text}\n")
+                self._has_rendered_prefix = True
+
+    def finish_on_interrupt(self) -> None:
+        """Fecha linha aberta se o streaming for interrompido antes do evento FINAL."""
+        if self._in_text_block:
+            self._write("\n")
+            self._in_text_block = False
 
 
 def format_approval_prompt(
@@ -211,6 +286,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=False,
         help="Aprova automaticamente chamadas de ferramentas sem pedir confirmação interativa.",
     )
+    parser.add_argument(
+        "--no-stream",
+        dest="streaming",
+        action="store_false",
+        default=True,
+        help="Desabilita streaming em tempo real e exibe a resposta apenas ao concluir o turno.",
+    )
     return parser.parse_args(argv)
 
 
@@ -321,6 +403,7 @@ async def terminal_chat(
     provider_name: str | None = None,
     model_name: str | None = None,
     auto_approve: bool = False,
+    streaming: bool = True,
 ) -> dict[str, Any]:
     provider_kwargs: dict[str, Any] = {"model": model_name} if model_name else {}
     provider = get_provider(provider_name, **provider_kwargs)
@@ -426,13 +509,24 @@ async def terminal_chat(
         )
 
         print("\n[Agente pensando...]")
+        renderer = TerminalStreamRenderer() if streaming else None
         try:
-            response = await agent.run(user_input)
+            if renderer is not None:
+                async with contextlib.aclosing(agent.run_stream(user_input)) as events:
+                    async for event in events:
+                        renderer.handle(event)
+                response = renderer.final_text
+            else:
+                response = await agent.run(user_input)
         except (AgentLimitError, StopIteration) as exc:
+            if renderer is not None:
+                renderer.finish_on_interrupt()
             persist_session()
             print(f"\n[Limite atingido]: {exc}\n")
             continue
         except KeyboardInterrupt:
+            if renderer is not None:
+                renderer.finish_on_interrupt()
             if agent.n_turns == prev_turns:
                 del agent.messages[prev_msg_count:]
                 session_data["history"].pop()
@@ -444,6 +538,8 @@ async def terminal_chat(
             print("-" * 60)
             continue
         except Exception as exc:
+            if renderer is not None:
+                renderer.finish_on_interrupt()
             if agent.n_turns == prev_turns:
                 del agent.messages[prev_msg_count:]
                 session_data["history"].pop()
@@ -464,7 +560,10 @@ async def terminal_chat(
         )
         persist_session()
 
-        print(f"\nAgente: {response}\n")
+        if renderer is None:
+            print(f"\nAgente: {response}\n")
+        else:
+            print()
         print("-" * 60)
 
     session_data["ended_at"] = datetime.now().isoformat()
@@ -494,5 +593,6 @@ if __name__ == "__main__":
             provider_name=cli_args.provider,
             model_name=cli_args.model,
             auto_approve=cli_args.auto_approve,
+            streaming=cli_args.streaming,
         )
     )
