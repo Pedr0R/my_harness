@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
 import json
 import os
 from typing import Any
 import httpx
 from dotenv import load_dotenv
 
-from providers.base import ModelResponse, ToolCall
+from providers.base import ModelResponse, StreamChunk, ToolCall
 
 load_dotenv()
 
@@ -29,11 +30,13 @@ class OpenAICompatibleProvider:
         self.base_url = (base_url or os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")).rstrip("/")
         self.timeout = timeout
 
-    async def complete(
+    def _build_request_payload(
         self,
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]],
-    ) -> ModelResponse:
+        *,
+        stream: bool = False,
+    ) -> tuple[str, dict[str, str], dict[str, Any]]:
         headers = {
             "Content-Type": "application/json",
             "Authorization": f"Bearer {self.api_key}",
@@ -58,7 +61,7 @@ class OpenAICompatibleProvider:
         # Converte as mensagens universais para o formato esperado pela API
         formatted_messages = []
         for m in messages:
-            msg_dict = {"role": m.get("role", "user"), "content": m.get("content", "")}
+            msg_dict: dict[str, Any] = {"role": m.get("role", "user"), "content": m.get("content", "")}
             if m.get("tool_calls"):
                 msg_dict["tool_calls"] = [
                     {
@@ -81,8 +84,26 @@ class OpenAICompatibleProvider:
         }
         if formatted_tools:
             payload["tools"] = formatted_tools
+        if stream:
+            payload["stream"] = True
 
         url = f"{self.base_url}/chat/completions"
+        return url, headers, payload
+
+    @staticmethod
+    def _parse_tool_args(args_str: str) -> dict[str, Any]:
+        try:
+            return json.loads(args_str)
+        except Exception:
+            return {"raw": args_str}
+
+    async def complete(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+    ) -> ModelResponse:
+        url, headers, payload = self._build_request_payload(messages, tools)
+
         async with httpx.AsyncClient(timeout=self.timeout) as client:
             response = await client.post(url, headers=headers, json=payload)
             if response.status_code >= 400:
@@ -99,16 +120,11 @@ class OpenAICompatibleProvider:
             for tc in choice["tool_calls"]:
                 fn = tc.get("function", {})
                 args_str = fn.get("arguments", "{}")
-                try:
-                    args = json.loads(args_str)
-                except Exception:
-                    args = {"raw": args_str}
-
                 tool_calls.append(
                     ToolCall(
                         id=tc.get("id", f"call_{fn.get('name')}"),
                         name=fn.get("name", ""),
-                        args=args,
+                        args=self._parse_tool_args(args_str),
                     )
                 )
 
@@ -118,6 +134,84 @@ class OpenAICompatibleProvider:
             content=content_text,
             tool_calls=tool_calls,
             cost=cost,
+        )
+
+    async def stream(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+    ) -> AsyncIterator[StreamChunk]:
+        url, headers, payload = self._build_request_payload(messages, tools, stream=True)
+        content_parts: list[str] = []
+        tool_calls_by_index: dict[int, dict[str, Any]] = {}
+        usage: dict[str, Any] | None = None
+
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            async with client.stream("POST", url, headers=headers, json=payload) as response:
+                if response.status_code >= 400:
+                    error_body = (await response.aread()).decode("utf-8", errors="replace")
+                    raise RuntimeError(
+                        f"Erro de API [{response.status_code}] retornado por {self.base_url}: {error_body}"
+                    )
+
+                async for line in response.aiter_lines():
+                    stripped = line.strip()
+                    if not stripped or stripped.startswith(":") or not stripped.startswith("data:"):
+                        continue
+
+                    raw_data = stripped[5:].strip()
+                    if not raw_data:
+                        continue
+                    if raw_data == "[DONE]":
+                        break
+
+                    chunk_data = json.loads(raw_data)
+                    if chunk_data.get("usage") is not None:
+                        usage = chunk_data["usage"]
+
+                    choices = chunk_data.get("choices") or []
+                    if not choices:
+                        continue
+
+                    delta = choices[0].get("delta") or {}
+                    text_delta = delta.get("content")
+                    if text_delta:
+                        content_parts.append(text_delta)
+                        yield StreamChunk(text_delta=text_delta)
+
+                    for tc_delta in delta.get("tool_calls") or []:
+                        idx = int(tc_delta.get("index", 0))
+                        entry = tool_calls_by_index.setdefault(
+                            idx,
+                            {"id": "", "name": "", "arguments": []},
+                        )
+                        if tc_delta.get("id"):
+                            entry["id"] = tc_delta["id"]
+                        fn = tc_delta.get("function") or {}
+                        if fn.get("name"):
+                            entry["name"] += fn["name"]
+                        if fn.get("arguments"):
+                            entry["arguments"].append(fn["arguments"])
+
+        tool_calls: list[ToolCall] = []
+        for idx in sorted(tool_calls_by_index):
+            entry = tool_calls_by_index[idx]
+            name = entry["name"]
+            raw_args = "".join(entry["arguments"]) or "{}"
+            tool_calls.append(
+                ToolCall(
+                    id=entry["id"] or f"call_{name}_{idx}",
+                    name=name,
+                    args=self._parse_tool_args(raw_args),
+                )
+            )
+
+        yield StreamChunk(
+            response=ModelResponse(
+                content="".join(content_parts),
+                tool_calls=tool_calls,
+                cost=self._calculate_cost(usage),
+            )
         )
 
     def _calculate_cost(self, usage: dict[str, Any] | None) -> float:

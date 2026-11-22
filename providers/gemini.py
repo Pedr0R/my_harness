@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
 import os
 from typing import Any
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types
 
-from providers.base import ModelResponse, ToolCall
+from providers.base import ModelResponse, StreamChunk, ToolCall
 
 load_dotenv()
 
@@ -38,18 +39,25 @@ class GeminiProvider:
         else:
             self.client = genai.Client()
 
+    def _build_request(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+    ) -> tuple[list[types.Content], types.GenerateContentConfig]:
+        system_instruction, contents = self._convert_messages(messages)
+        gemini_tools = self._convert_tools(tools) if tools else None
+        config = types.GenerateContentConfig(
+            system_instruction=system_instruction if system_instruction else None,
+            tools=[gemini_tools] if gemini_tools else None,
+        )
+        return contents, config
+
     async def complete(
         self,
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]],
     ) -> ModelResponse:
-        system_instruction, contents = self._convert_messages(messages)
-        gemini_tools = self._convert_tools(tools) if tools else None
-
-        config = types.GenerateContentConfig(
-            system_instruction=system_instruction if system_instruction else None,
-            tools=[gemini_tools] if gemini_tools else None,
-        )
+        contents, config = self._build_request(messages, tools)
 
         response = await self.client.aio.models.generate_content(
             model=self.model_name,
@@ -90,6 +98,61 @@ class GeminiProvider:
             tool_calls=tool_calls,
             cost=cost,
             raw_content=raw_content,
+        )
+
+    async def stream(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+    ) -> AsyncIterator[StreamChunk]:
+        contents, config = self._build_request(messages, tools)
+
+        response_stream = await self.client.aio.models.generate_content_stream(
+            model=self.model_name,
+            contents=contents,
+            config=config,
+        )
+
+        text_chunks: list[str] = []
+        raw_parts: list[types.Part] = []
+        tool_calls: list[ToolCall] = []
+        last_usage: Any = None
+
+        async for chunk in response_stream:
+            if chunk.candidates and chunk.candidates[0].content and chunk.candidates[0].content.parts:
+                parts = chunk.candidates[0].content.parts
+                raw_parts.extend(parts)
+                chunk_text = "".join(
+                    part.text
+                    for part in parts
+                    if getattr(part, "text", None)
+                )
+                if chunk_text:
+                    text_chunks.append(chunk_text)
+                    yield StreamChunk(text_delta=chunk_text)
+
+            if getattr(chunk, "function_calls", None):
+                for fc in chunk.function_calls:
+                    idx = len(tool_calls)
+                    tool_calls.append(
+                        ToolCall(
+                            id=f"call_{fc.name}_{idx}",
+                            name=fc.name,
+                            args=dict(fc.args) if fc.args else {},
+                        )
+                    )
+
+            if getattr(chunk, "usage_metadata", None) is not None:
+                last_usage = chunk.usage_metadata
+
+        raw_content = types.Content(role="model", parts=raw_parts) if raw_parts else None
+        yield StreamChunk(
+            response=ModelResponse(
+                content="".join(text_chunks),
+                tool_calls=tool_calls,
+                cost=self._calculate_cost(last_usage),
+                raw_content=raw_content,
+            )
         )
 
     def _convert_messages(
