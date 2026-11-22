@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from typing import Any, Protocol, runtime_checkable
 
@@ -59,3 +60,42 @@ class ModelProvider(Protocol):
     ) -> ModelResponse:
         """Recebe mensagens e ferramentas no formato padrão e retorna uma ModelResponse normalizada."""
         ...
+
+
+@dataclass(frozen=True)
+class StreamChunk:
+    """Evento incremental emitido por um provedor durante o streaming de um turno."""
+
+    text_delta: str = ""
+    response: ModelResponse | None = None
+
+
+@runtime_checkable
+class StreamingModelProvider(ModelProvider, Protocol):
+    """Extensão opcional do protocolo para provedores com suporte nativo a streaming."""
+
+    def stream(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+    ) -> AsyncIterator[StreamChunk]:
+        """Emite chunks incrementais e encerra com a ModelResponse consolidada."""
+        ...
+
+
+async def stream_or_complete(
+    provider: ModelProvider,
+    messages: list[dict[str, Any]],
+    tools: list[dict[str, Any]],
+) -> AsyncIterator[StreamChunk]:
+    """Consome streaming nativo do provedor ou adapta complete() para emissão única."""
+    stream_fn = getattr(provider, "stream", None)
+    if callable(stream_fn):
+        async for chunk in stream_fn(messages, tools):
+            yield chunk
+        return
+
+    response = await provider.complete(messages, tools)
+    if response.content:
+        yield StreamChunk(text_delta=response.content)
+    yield StreamChunk(response=response)

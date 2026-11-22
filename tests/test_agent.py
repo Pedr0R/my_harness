@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import AsyncIterator
+import contextlib
 import io
 import json
 import os
@@ -13,11 +15,19 @@ from unittest import mock
 
 from google.genai import types
 
-from agent import Agent, AgentLimitError, ApprovalAction, ApprovalDecision, discover_context
+from agent import (
+    Agent,
+    AgentEvent,
+    AgentLimitError,
+    ApprovalAction,
+    ApprovalDecision,
+    EventType,
+    discover_context,
+)
 from guardrails import CommandSafetyGuardrail, PathSandboxingGuardrail
 from guardrails.base import BaseGuardrail, GuardrailResult
 import main
-from providers.base import ModelResponse, ToolCall
+from providers.base import ModelResponse, StreamChunk, ToolCall
 from tools import TOOL_SCHEMAS
 
 
@@ -965,6 +975,345 @@ class TestAgentHumanInTheLoop(unittest.TestCase):
         self.assertIn("ATIVADO", out)
         self.assertIn("DESATIVADO", out)
         self.assertIn("/auto-approve [on|off]", out)
+
+
+class _StreamingFakeProvider:
+    def __init__(self, turns: list[list[StreamChunk]]) -> None:
+        self._turns = list(turns)
+        self.calls: list[tuple[list[dict[str, Any]], list[dict[str, Any]]]] = []
+
+    async def complete(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+    ) -> ModelResponse:
+        raise AssertionError("complete should not be called when stream is implemented")
+
+    async def stream(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+    ) -> AsyncIterator[StreamChunk]:
+        self.calls.append(([dict(m) for m in messages], list(tools)))
+        chunks = self._turns.pop(0) if self._turns else [StreamChunk(response=ModelResponse(content=""))]
+        for chunk in chunks:
+            yield chunk
+
+
+class TestAgentStreaming(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = pathlib.Path(self._tmp.name).resolve()
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def test_run_stream_emits_ordered_events_across_tool_calls_with_native_streaming_provider(self) -> None:
+        target = self.root / "streamed.txt"
+        tool_call = ToolCall(
+            id="call_write_1",
+            name="write_file",
+            args={"path": str(target), "content": "streamed_content"},
+        )
+        provider = _StreamingFakeProvider(
+            [
+                [
+                    StreamChunk(text_delta="Vou "),
+                    StreamChunk(text_delta="criar."),
+                    StreamChunk(
+                        response=ModelResponse(
+                            content="Vou criar.",
+                            tool_calls=[tool_call],
+                            cost=0.01,
+                        )
+                    ),
+                ],
+                [
+                    StreamChunk(text_delta="Tudo "),
+                    StreamChunk(text_delta="pronto!"),
+                    StreamChunk(
+                        response=ModelResponse(
+                            content="Tudo pronto!",
+                            cost=0.02,
+                        )
+                    ),
+                ],
+            ]
+        )
+        agent = Agent(model=provider, instructions="sys")
+
+        async def collect() -> list[AgentEvent]:
+            events: list[AgentEvent] = []
+            async with contextlib.aclosing(agent.run_stream("create file")) as stream:
+                async for ev in stream:
+                    events.append(ev)
+            return events
+
+        events = asyncio.run(collect())
+        self.assertEqual(
+            [ev.type for ev in events],
+            [
+                EventType.TOKEN,
+                EventType.TOKEN,
+                EventType.TOOL_START,
+                EventType.TOOL_END,
+                EventType.TOKEN,
+                EventType.TOKEN,
+                EventType.FINAL,
+            ],
+        )
+        self.assertEqual([ev.text for ev in events[:2]], ["Vou ", "criar."])
+        self.assertEqual(events[2].tool_name, "write_file")
+        self.assertEqual(events[2].tool_args, {"path": str(target), "content": "streamed_content"})
+        self.assertEqual(events[2].tool_call_id, "call_write_1")
+        self.assertEqual(events[3].tool_name, "write_file")
+        self.assertEqual(events[3].tool_call_id, "call_write_1")
+        self.assertIn("escreveu", events[3].tool_output or "")
+        self.assertEqual([ev.text for ev in events[4:6]], ["Tudo ", "pronto!"])
+        self.assertEqual(events[6].text, "Tudo pronto!")
+
+        self.assertEqual(target.read_text(encoding="utf-8"), "streamed_content")
+        self.assertEqual(agent.n_turns, 2)
+        self.assertAlmostEqual(agent.cost, 0.03)
+
+    def test_run_stream_falls_back_for_non_streaming_provider_and_matches_run_state(self) -> None:
+        target_run = self.root / "run.txt"
+        target_stream = self.root / "stream.txt"
+
+        def build_responses(path: pathlib.Path) -> list[ModelResponse]:
+            return [
+                ModelResponse(
+                    content="escrevendo",
+                    tool_calls=[
+                        ToolCall(id="c1", name="write_file", args={"path": str(path), "content": "ok"})
+                    ],
+                    cost=0.05,
+                ),
+                ModelResponse(content="concluido", cost=0.07),
+            ]
+
+        agent_run = Agent(model=FakeProvider(build_responses(target_run)), instructions="sys")
+        agent_stream = Agent(model=FakeProvider(build_responses(target_stream)), instructions="sys")
+
+        run_reply = asyncio.run(agent_run.run("write"))
+
+        async def collect() -> list[AgentEvent]:
+            async with contextlib.aclosing(agent_stream.run_stream("write")) as stream:
+                return [ev async for ev in stream]
+
+        stream_events = asyncio.run(collect())
+        self.assertEqual(
+            [ev.type for ev in stream_events],
+            [
+                EventType.TOKEN,
+                EventType.TOOL_START,
+                EventType.TOOL_END,
+                EventType.TOKEN,
+                EventType.FINAL,
+            ],
+        )
+        self.assertEqual(run_reply, "concluido")
+        self.assertEqual(stream_events[-1].text, run_reply)
+        self.assertEqual(agent_stream.n_turns, agent_run.n_turns)
+        self.assertAlmostEqual(agent_stream.cost, agent_run.cost)
+        self.assertEqual(
+            [
+                {k: v for k, v in m.items() if k != "tool_calls"}
+                for m in agent_stream.messages
+                if m["role"] != "tool"
+            ],
+            [
+                {k: v for k, v in m.items() if k != "tool_calls"}
+                for m in agent_run.messages
+                if m["role"] != "tool"
+            ],
+        )
+        self.assertEqual(target_run.read_text(encoding="utf-8"), "ok")
+        self.assertEqual(target_stream.read_text(encoding="utf-8"), "ok")
+
+    def test_run_stream_preserves_hitl_rejection_between_tool_start_and_tool_end(self) -> None:
+        target = self.root / "blocked.txt"
+        provider = FakeProvider(
+            [
+                ModelResponse(
+                    content="",
+                    tool_calls=[
+                        ToolCall(id="c_rej", name="write_file", args={"path": str(target), "content": "x"})
+                    ],
+                ),
+                ModelResponse(content="Cancelado conforme solicitado."),
+            ]
+        )
+        agent = Agent(
+            model=provider,
+            instructions="sys",
+            auto_approve=False,
+            approval_callback=lambda _name, _args: ApprovalDecision(
+                ApprovalAction.REJECT,
+                reason="bloqueado pelo usuário",
+            ),
+        )
+
+        async def collect() -> list[AgentEvent]:
+            async with contextlib.aclosing(agent.run_stream("try write")) as stream:
+                return [ev async for ev in stream]
+
+        events = asyncio.run(collect())
+        self.assertEqual(
+            [ev.type for ev in events],
+            [EventType.TOOL_START, EventType.TOOL_END, EventType.TOKEN, EventType.FINAL],
+        )
+        self.assertFalse(target.exists())
+        self.assertIn("bloqueado pelo usuário", events[1].tool_output or "")
+        self.assertEqual(events[3].text, "Cancelado conforme solicitado.")
+
+    def test_run_stream_rolls_back_workspace_on_early_consumer_close(self) -> None:
+        repo = self.root / "repo"
+        repo.mkdir()
+        subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True)
+        subprocess.run(["git", "config", "user.name", "Test User"], cwd=repo, check=True)
+        app_file = repo / "app.py"
+        app_file.write_text("VALUE = 1\n", encoding="utf-8")
+        subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
+        subprocess.run(["git", "commit", "-m", "initial"], cwd=repo, check=True, capture_output=True)
+
+        provider = _StreamingFakeProvider(
+            [
+                [
+                    StreamChunk(text_delta="Editando..."),
+                    StreamChunk(
+                        response=ModelResponse(
+                            content="Editando...",
+                            tool_calls=[
+                                ToolCall(
+                                    id="c1",
+                                    name="write_file",
+                                    args={"path": str(app_file), "content": "VALUE = 99\n"},
+                                )
+                            ],
+                        )
+                    ),
+                ],
+                [
+                    StreamChunk(text_delta="Nunca exibido"),
+                    StreamChunk(response=ModelResponse(content="Nunca exibido")),
+                ],
+            ]
+        )
+        agent = Agent(
+            model=provider,
+            instructions="sys",
+            checkpointing=True,
+            workspace_dir=repo,
+        )
+
+        async def cancel_after_tool_end() -> None:
+            async with contextlib.aclosing(agent.run_stream("edit and cancel")) as stream:
+                async for ev in stream:
+                    if ev.type is EventType.TOOL_END:
+                        self.assertEqual(app_file.read_text(encoding="utf-8"), "VALUE = 99\n")
+                        break
+
+        asyncio.run(cancel_after_tool_end())
+        self.assertEqual(app_file.read_text(encoding="utf-8"), "VALUE = 1\n")
+        self.assertIsNotNone(agent.last_rollback_message)
+        self.assertIn("Workspace restaurado", agent.last_rollback_message or "")
+
+
+class TestTerminalStreamRenderer(unittest.TestCase):
+    def test_cli_parse_args_no_stream_flag(self) -> None:
+        self.assertTrue(main.parse_args([]).streaming)
+        self.assertFalse(main.parse_args(["--no-stream"]).streaming)
+
+    def test_renderer_streams_tokens_pauses_for_tool_and_resumes(self) -> None:
+        class _TrackingBuffer(io.StringIO):
+            def __init__(self) -> None:
+                super().__init__()
+                self.flush_count = 0
+
+            def flush(self) -> None:
+                self.flush_count += 1
+                super().flush()
+
+        buf = _TrackingBuffer()
+        renderer = main.TerminalStreamRenderer(stream=buf)
+
+        events = [
+            AgentEvent(type=EventType.TOKEN, text="Vou "),
+            AgentEvent(type=EventType.TOKEN, text="verificar."),
+            AgentEvent(
+                type=EventType.TOOL_START,
+                tool_name="read_file",
+                tool_args={"path": "app.py"},
+                tool_call_id="c1",
+            ),
+            AgentEvent(
+                type=EventType.TOOL_END,
+                tool_name="read_file",
+                tool_output="   1: VALUE = 1\n   2: VALUE = 2",
+                tool_call_id="c1",
+            ),
+            AgentEvent(type=EventType.TOKEN, text="Tudo "),
+            AgentEvent(type=EventType.TOKEN, text="certo!"),
+            AgentEvent(type=EventType.FINAL, text="Tudo certo!"),
+        ]
+        for ev in events:
+            renderer.handle(ev)
+
+        output = buf.getvalue()
+        self.assertEqual(renderer.final_text, "Tudo certo!")
+        self.assertGreaterEqual(buf.flush_count, len(events))
+        self.assertIn("\nAgente: Vou verificar.\n", output)
+        self.assertIn("[Executando ferramenta]: read_file (app.py)\n", output)
+        self.assertIn("[Ferramenta concluída]: read_file ->    1: VALUE = 1\n", output)
+        self.assertIn("\nTudo certo!\n", output)
+
+    def test_renderer_tool_first_then_tokens_prints_agente_prefix(self) -> None:
+        buf = io.StringIO()
+        renderer = main.TerminalStreamRenderer(stream=buf)
+
+        for ev in [
+            AgentEvent(
+                type=EventType.TOOL_START,
+                tool_name="bash",
+                tool_args={"cmd": "echo hi"},
+                tool_call_id="c1",
+            ),
+            AgentEvent(
+                type=EventType.TOOL_END,
+                tool_name="bash",
+                tool_output="exit=0\nstdout:\nhi",
+                tool_call_id="c1",
+            ),
+            AgentEvent(type=EventType.TOKEN, text="Pronto."),
+            AgentEvent(type=EventType.FINAL, text="Pronto."),
+        ]:
+            renderer.handle(ev)
+
+        output = buf.getvalue()
+        self.assertIn("[Executando ferramenta]: bash (echo hi)\n", output)
+        self.assertIn("[Ferramenta concluída]: bash -> exit=0\n", output)
+        self.assertIn("\nAgente: Pronto.\n", output)
+
+    def test_renderer_handles_final_without_preceding_tokens(self) -> None:
+        buf = io.StringIO()
+        renderer = main.TerminalStreamRenderer(stream=buf)
+
+        renderer.handle(AgentEvent(type=EventType.FINAL, text="Resposta única."))
+
+        self.assertEqual(renderer.final_text, "Resposta única.")
+        self.assertEqual(buf.getvalue(), "\nAgente: Resposta única.\n")
+
+    def test_renderer_finish_on_interrupt_closes_open_text_line_idempotently(self) -> None:
+        buf = io.StringIO()
+        renderer = main.TerminalStreamRenderer(stream=buf)
+
+        renderer.handle(AgentEvent(type=EventType.TOKEN, text="Parcial"))
+        renderer.finish_on_interrupt()
+        renderer.finish_on_interrupt()
+
+        self.assertEqual(buf.getvalue(), "\nAgente: Parcial\n")
 
 
 if __name__ == "__main__":

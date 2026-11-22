@@ -14,6 +14,7 @@ Um harness leve e modular para agentes autônomos de software (SWE Agents) em Py
   - `list_dir`: Listagem hierárquica de diretórios e arquivos com profundidade configurável (`max_depth`).
   - `find_files`: Busca recursiva de arquivos por padrão glob de nome ou caminho relativo.
 - **Chat Interativo no Terminal**: Conversação contínua com histórico e memória em array/dicionário.
+- **Streaming em Tempo Real**: Emissão progressiva de tokens e eventos de execução de ferramentas (`Agent.run_stream`), com suporte nativo em Gemini e APIs compatíveis via SSE, fallback para provedores sem streaming e flag `--no-stream`.
 - **Persistência de Sessões**: Salvamento automático após cada turno em `.sessions/<session_id>.json` e retomada via CLI (`--session`) ou comando `/load`.
 - **Guardrails de Segurança**: Sandboxing de caminhos (`read_file`/`write_file`/`search_replace`/`grep`/`list_dir`/`find_files`), bloqueio de comandos destrutivos no `bash`, redação automática de segredos (`[REDACTED]`) e detecção de loops de ferramentas.
 - **Confirmação Humana (HitL)**: Aprovação interativa antes de executar chamadas com efeito colateral (`bash`, `write_file`, `search_replace`), com suporte a aprovar a sessão (`a`), flag `--auto-approve` (`-y`) e comando `/auto-approve`.
@@ -86,6 +87,7 @@ python main.py --disable-guardrail loop_detection
 python main.py --disable-guardrail all
 python main.py --no-checkpoint
 python main.py --auto-approve
+python main.py --no-stream
 ```
 
 Também é possível controlar cada guardrail via variáveis de ambiente (`GUARDRAIL_PATH_SANDBOXING`, `GUARDRAIL_COMMAND_SAFETY`, `GUARDRAIL_SECRETS_REDACTION`, `GUARDRAIL_LOOP_DETECTION`) com `true`/`false`.
