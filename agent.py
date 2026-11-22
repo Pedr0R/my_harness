@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
+import contextlib
 from dataclasses import dataclass, field
 from enum import Enum
 import inspect
@@ -13,7 +15,7 @@ from guardrails import (
     run_guardrail_checks,
     sanitize_with_guardrails,
 )
-from providers import ModelProvider, get_provider
+from providers import ModelProvider, ModelResponse, get_provider, stream_or_complete
 from session import load_session_file, save_session_file
 from tools import APPROVAL_REQUIRED_TOOLS, TOOLS, TOOL_SCHEMAS, _truncate
 from workspace import CheckpointResult, WorkspaceCheckpoint
@@ -21,11 +23,13 @@ from workspace import CheckpointResult, WorkspaceCheckpoint
 
 __all__ = [
     "Agent",
+    "AgentEvent",
     "AgentLimitError",
     "ApprovalAction",
     "ApprovalCallback",
     "ApprovalDecision",
     "ApprovalResult",
+    "EventType",
     "discover_context",
 ]
 
@@ -35,6 +39,27 @@ _MAX_CHECKPOINTS = 20
 
 class AgentLimitError(Exception):
     """Exceção levantada quando o agente atinge o limite configurado de turnos ou custo."""
+
+
+class EventType(str, Enum):
+    """Tipos de eventos emitidos pelo loop assíncrono do agente durante streaming."""
+
+    TOKEN = "token"
+    TOOL_START = "tool_start"
+    TOOL_END = "tool_end"
+    FINAL = "final"
+
+
+@dataclass(frozen=True)
+class AgentEvent:
+    """Evento imutável emitido por Agent.run_stream para consumo pela CLI ou UI."""
+
+    type: EventType
+    text: str = ""
+    tool_name: str | None = None
+    tool_args: dict[str, Any] | None = None
+    tool_output: str | None = None
+    tool_call_id: str | None = None
 
 
 class ApprovalAction(str, Enum):
@@ -270,8 +295,8 @@ class Agent:
         sanitized = sanitize_with_guardrails(self.guardrails, call_name, str(raw_output))
         return _truncate(sanitized)
 
-    async def run(self, task: str) -> str:
-        """Executa um turno de raciocínio e ação do agente para atender à tarefa."""
+    async def run_stream(self, task: str) -> AsyncIterator[AgentEvent]:
+        """Executa o loop de raciocínio e ação emitindo eventos tipados em tempo real."""
         self.last_rollback_message = None
 
         if not self.messages:
@@ -292,7 +317,19 @@ class Agent:
             while True:
                 await self._check_limits()
                 await self._maybe_compact()
-                resp = await self.model.complete(self.messages, tools=self.tool_schemas)
+
+                resp: Any = None
+                fallback_text: list[str] = []
+                async for chunk in stream_or_complete(self.model, self.messages, self.tool_schemas):
+                    if chunk.text_delta:
+                        fallback_text.append(chunk.text_delta)
+                        yield AgentEvent(type=EventType.TOKEN, text=chunk.text_delta)
+                    if chunk.response is not None:
+                        resp = chunk.response
+
+                if resp is None:
+                    resp = ModelResponse(content="".join(fallback_text))
+
                 self.n_turns += 1
                 self.cost += resp.get("cost", 0.0)
 
@@ -303,13 +340,21 @@ class Agent:
                 if not tool_calls:
                     if checkpoint is not None and checkpoint.is_active:
                         self._record_checkpoint(checkpoint)
-                    return resp.get("content", "")
+                    yield AgentEvent(type=EventType.FINAL, text=resp.get("content", ""))
+                    return
 
                 for call in tool_calls:
                     call_name = call["name"] if isinstance(call, dict) else call.name
                     call_args = call["args"] if isinstance(call, dict) else call.args
                     call_id = call.get("id") if isinstance(call, dict) else getattr(call, "id", f"call_{call_name}")
+                    event_args = dict(call_args) if isinstance(call_args, dict) else {}
 
+                    yield AgentEvent(
+                        type=EventType.TOOL_START,
+                        tool_name=call_name,
+                        tool_args=event_args,
+                        tool_call_id=call_id,
+                    )
                     tool_output = await self._execute_tool_call(call_name, call_args)
                     self.messages.append(
                         {
@@ -319,6 +364,12 @@ class Agent:
                             "content": tool_output,
                         }
                     )
+                    yield AgentEvent(
+                        type=EventType.TOOL_END,
+                        tool_name=call_name,
+                        tool_output=tool_output,
+                        tool_call_id=call_id,
+                    )
         except BaseException as exc:
             if checkpoint is not None and checkpoint.is_active:
                 if _is_limit_stop(exc):
@@ -327,3 +378,12 @@ class Agent:
                     result = checkpoint.rollback()
                     self.last_rollback_message = result.message
             raise
+
+    async def run(self, task: str) -> str:
+        """Executa um turno completo de raciocínio e ação retornando o texto final."""
+        final_text = ""
+        async with contextlib.aclosing(self.run_stream(task)) as events:
+            async for event in events:
+                if event.type is EventType.FINAL:
+                    final_text = event.text
+        return final_text
