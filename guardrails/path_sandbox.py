@@ -38,6 +38,14 @@ class PathSandboxingGuardrail(BaseGuardrail):
             pathlib.Path(root_dir).resolve() if root_dir is not None else None
         )
 
+    def clone(
+        self,
+        *,
+        root_dir: str | pathlib.Path | None = None,
+    ) -> PathSandboxingGuardrail:
+        effective_root = root_dir if root_dir is not None else self.root_dir
+        return PathSandboxingGuardrail(root_dir=effective_root, enabled=self.enabled)
+
     def check_tool_call(self, tool_name: str, args: dict[str, Any]) -> GuardrailResult:
         if not self.enabled or tool_name not in FILE_TOOLS:
             return GuardrailResult(allowed=True)

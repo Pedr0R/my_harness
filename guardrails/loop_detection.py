@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import pathlib
 from typing import Any
 
 from guardrails.base import BaseGuardrail, GuardrailResult
@@ -65,3 +66,15 @@ class LoopDetectionGuardrail(BaseGuardrail):
         self._last_signature = None
         self._repeat_count = 0
         self._warn_pending = False
+
+    def clone(
+        self,
+        *,
+        root_dir: str | pathlib.Path | None = None,
+    ) -> LoopDetectionGuardrail:
+        del root_dir
+        return LoopDetectionGuardrail(
+            max_repeats=self.max_repeats,
+            block_on_loop=self.block_on_loop,
+            enabled=self.enabled,
+        )

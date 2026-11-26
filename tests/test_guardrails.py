@@ -21,6 +21,8 @@ from guardrails import (
     PathSandboxingGuardrail,
     SecretsRedactionGuardrail,
     build_guardrails,
+    clone_guardrails,
+    run_guardrail_checks,
 )
 import main as cli_main
 from providers.base import ModelResponse, ToolCall
@@ -714,6 +716,252 @@ class TestAgentGuardrailsIntegration(unittest.TestCase):
         agent.model = provider3
         self.assertEqual(asyncio.run(agent.run("após load")), "reloaded ok")
         self.assertIn("beta", agent.messages[-2]["content"])
+
+
+class TestGuardrailCloning(unittest.TestCase):
+    def test_loop_detection_clone_starts_clean_and_isolates_state(self) -> None:
+        parent = LoopDetectionGuardrail(max_repeats=3, block_on_loop=True, enabled=True)
+        args = {"path": "a.txt"}
+
+        self.assertTrue(parent.check_tool_call("read_file", args).allowed)
+        self.assertTrue(parent.check_tool_call("read_file", args).allowed)
+
+        child = parent.clone()
+        self.assertIsNot(child, parent)
+        self.assertEqual(child.max_repeats, 3)
+        self.assertTrue(child.block_on_loop)
+        self.assertTrue(child.enabled)
+
+        self.assertTrue(child.check_tool_call("read_file", args).allowed)
+        self.assertTrue(child.check_tool_call("read_file", args).allowed)
+        blocked_child = child.check_tool_call("read_file", args)
+        self.assertFalse(blocked_child.allowed)
+        self.assertIn("loop detection", (blocked_child.reason or "").lower())
+
+        child.reset()
+        blocked_parent = parent.check_tool_call("read_file", args)
+        self.assertFalse(blocked_parent.allowed)
+
+        warn_parent = LoopDetectionGuardrail(max_repeats=2, block_on_loop=False, enabled=True)
+        self.assertTrue(warn_parent.check_tool_call("read_file", args).allowed)
+        self.assertTrue(warn_parent.check_tool_call("read_file", args).allowed)
+        warn_child = warn_parent.clone()
+        self.assertIsNot(warn_child, warn_parent)
+        self.assertFalse(warn_child.block_on_loop)
+        self.assertEqual(warn_child.sanitize_output("read_file", "ok"), "ok")
+        self.assertIn("[Guardrail warning]", warn_parent.sanitize_output("read_file", "ok"))
+
+        disabled_clone = LoopDetectionGuardrail(max_repeats=2, enabled=False).clone()
+        self.assertFalse(disabled_clone.enabled)
+
+    def test_path_sandboxing_clone_preserves_or_overrides_root_dir(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root_a = (pathlib.Path(tmp) / "workspace_a").resolve()
+            root_b = (pathlib.Path(tmp) / "workspace_b").resolve()
+            root_a.mkdir()
+            root_b.mkdir()
+
+            parent = PathSandboxingGuardrail(root_dir=root_a, enabled=True)
+            same_clone = parent.clone()
+            self.assertIsNot(same_clone, parent)
+            self.assertEqual(same_clone.root_dir, root_a)
+            self.assertTrue(same_clone.enabled)
+            self.assertTrue(
+                same_clone.check_tool_call("read_file", {"path": str(root_a / "a.txt")}).allowed
+            )
+            self.assertFalse(
+                same_clone.check_tool_call("read_file", {"path": str(root_b / "b.txt")}).allowed
+            )
+
+            rebound_clone = parent.clone(root_dir=str(root_b))
+            self.assertIsNot(rebound_clone, parent)
+            self.assertEqual(rebound_clone.root_dir, root_b)
+            self.assertEqual(parent.root_dir, root_a)
+            self.assertTrue(
+                rebound_clone.check_tool_call("read_file", {"path": str(root_b / "b.txt")}).allowed
+            )
+            self.assertFalse(
+                rebound_clone.check_tool_call("read_file", {"path": str(root_a / "a.txt")}).allowed
+            )
+
+            disabled_rebound = PathSandboxingGuardrail(
+                root_dir=root_a, enabled=False
+            ).clone(root_dir=root_b)
+            self.assertFalse(disabled_rebound.enabled)
+            self.assertEqual(disabled_rebound.root_dir, root_b)
+
+            no_root_parent = PathSandboxingGuardrail(root_dir=None)
+            self.assertIsNone(no_root_parent.clone().root_dir)
+            self.assertEqual(no_root_parent.clone(root_dir=root_b).root_dir, root_b)
+
+    def test_command_safety_and_secrets_redaction_clone_preserve_config(self) -> None:
+        disabled_cmd = CommandSafetyGuardrail(enabled=False).clone()
+        self.assertFalse(disabled_cmd.enabled)
+        self.assertTrue(disabled_cmd.check_tool_call("bash", {"cmd": "rm -rf /"}).allowed)
+
+        cmd_parent = CommandSafetyGuardrail(enabled=True)
+        cmd_child = cmd_parent.clone()
+        self.assertIsNot(cmd_child, cmd_parent)
+        self.assertFalse(cmd_child.check_tool_call("bash", {"cmd": "rm -rf /"}).allowed)
+        cmd_child.enabled = False
+        self.assertTrue(cmd_parent.enabled)
+        self.assertFalse(cmd_parent.check_tool_call("bash", {"cmd": "rm -rf /"}).allowed)
+
+        secret_text = "GEMINI_API_KEY=AIzaSyTestFakeKey1234567890abcdef"
+        red_parent = SecretsRedactionGuardrail(replacement="<MASKED>", enabled=True)
+        red_child = red_parent.clone()
+        self.assertIsNot(red_child, red_parent)
+        self.assertEqual(red_child.replacement, "<MASKED>")
+        self.assertEqual(
+            red_child.sanitize_output("read_file", secret_text),
+            "GEMINI_API_KEY=<MASKED>",
+        )
+        red_child.enabled = False
+        self.assertTrue(red_parent.enabled)
+        self.assertEqual(
+            red_parent.sanitize_output("read_file", secret_text),
+            "GEMINI_API_KEY=<MASKED>",
+        )
+
+    def test_clone_guardrails_clones_full_pipeline_and_custom_subclasses(self) -> None:
+        class CustomSeenGuardrail(BaseGuardrail):
+            name = "custom_seen"
+
+            def __init__(self) -> None:
+                super().__init__(enabled=True)
+                self.seen: list[str] = []
+
+            def check_tool_call(self, tool_name: str, args: dict[str, Any]) -> GuardrailResult:
+                self.seen.append(f"{tool_name}:{args.get('path', '')}")
+                return GuardrailResult(allowed=True)
+
+            def reset(self) -> None:
+                self.seen.clear()
+
+        class DuckTypedGuardrail:
+            name = "duck_seen"
+
+            def __init__(self) -> None:
+                self.enabled = True
+                self.seen: list[str] = []
+
+            def check_tool_call(self, tool_name: str, args: dict[str, Any]) -> GuardrailResult:
+                self.seen.append(tool_name)
+                return GuardrailResult(allowed=True)
+
+            def sanitize_output(self, tool_name: str, output: str) -> str:
+                return output
+
+            def reset(self) -> None:
+                self.seen.clear()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root_a = (pathlib.Path(tmp) / "a").resolve()
+            root_b = (pathlib.Path(tmp) / "b").resolve()
+            root_a.mkdir()
+            root_b.mkdir()
+
+            custom_parent = CustomSeenGuardrail()
+            duck_parent = DuckTypedGuardrail()
+            parent_list = build_guardrails(
+                GuardrailsConfig(root_dir=root_a, loop_max_repeats=2)
+            ) + [custom_parent, duck_parent]
+
+            call_a = {"path": str(root_a / "x.txt")}
+            allowed, _, _ = run_guardrail_checks(parent_list, "read_file", call_a)
+            self.assertTrue(allowed)
+            self.assertEqual(len(custom_parent.seen), 1)
+            self.assertEqual(duck_parent.seen, ["read_file"])
+
+            child_list = clone_guardrails(parent_list, root_dir=root_b)
+            self.assertEqual(len(child_list), len(parent_list))
+            for parent_item, child_item in zip(parent_list, child_list, strict=True):
+                self.assertIsNot(child_item, parent_item)
+
+            child_sandbox = next(g for g in child_list if isinstance(g, PathSandboxingGuardrail))
+            parent_sandbox = next(g for g in parent_list if isinstance(g, PathSandboxingGuardrail))
+            self.assertEqual(child_sandbox.root_dir, root_b)
+            self.assertEqual(parent_sandbox.root_dir, root_a)
+
+            child_custom = child_list[-2]
+            child_duck = child_list[-1]
+            self.assertEqual(child_custom.seen, [])
+            self.assertEqual(child_duck.seen, [])
+            self.assertEqual(len(custom_parent.seen), 1)
+            self.assertEqual(duck_parent.seen, ["read_file"])
+
+            # Child loop detector starts fresh even after parent already saw 1 of 2 allowed calls
+            allowed_child_1, _, _ = run_guardrail_checks(
+                child_list, "read_file", {"path": str(root_b / "y.txt")}
+            )
+            self.assertTrue(allowed_child_1)
+
+            # Parent still hits loop limit on its next identical call
+            allowed_parent_2, reason_parent_2, _ = run_guardrail_checks(
+                parent_list, "read_file", call_a
+            )
+            self.assertFalse(allowed_parent_2)
+            self.assertIn("loop detection", (reason_parent_2 or "").lower())
+
+    def test_agents_with_cloned_guardrails_do_not_interfere(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root_a = (pathlib.Path(tmp) / "parent_ws").resolve()
+            root_b = (pathlib.Path(tmp) / "child_ws").resolve()
+            root_a.mkdir()
+            root_b.mkdir()
+            file_a = root_a / "a.txt"
+            file_b = root_b / "b.txt"
+            file_a.write_text("from a", encoding="utf-8")
+            file_b.write_text("from b", encoding="utf-8")
+
+            parent_agent = Agent(
+                model=FakeProvider(
+                    [
+                        ModelResponse(tool_calls=[ToolCall(id="p1", name="read_file", args={"path": str(file_a)})]),
+                        ModelResponse(tool_calls=[ToolCall(id="p2", name="read_file", args={"path": str(file_a)})]),
+                        ModelResponse(content="parent turn 1 ok"),
+                    ]
+                ),
+                guardrails=build_guardrails(GuardrailsConfig(root_dir=root_a, loop_max_repeats=3)),
+            )
+            child_agent = Agent(
+                model=FakeProvider(
+                    [
+                        ModelResponse(tool_calls=[ToolCall(id="c1", name="read_file", args={"path": str(file_b)})]),
+                        ModelResponse(tool_calls=[ToolCall(id="c2", name="read_file", args={"path": str(file_b)})]),
+                        ModelResponse(tool_calls=[ToolCall(id="c3", name="read_file", args={"path": str(file_a)})]),
+                        ModelResponse(content="child ok"),
+                    ]
+                ),
+                guardrails=clone_guardrails(parent_agent.guardrails, root_dir=root_b),
+            )
+
+            self.assertEqual(asyncio.run(parent_agent.run("parent reads a")), "parent turn 1 ok")
+            parent_tools_t1 = [m for m in parent_agent.messages if m.get("role") == "tool"]
+            self.assertEqual(len(parent_tools_t1), 2)
+            self.assertIn("from a", parent_tools_t1[0]["content"])
+            self.assertIn("from a", parent_tools_t1[1]["content"])
+
+            self.assertEqual(asyncio.run(child_agent.run("child reads b and tries a")), "child ok")
+            child_tools = [m for m in child_agent.messages if m.get("role") == "tool"]
+            self.assertEqual(len(child_tools), 3)
+            self.assertIn("from b", child_tools[0]["content"])
+            self.assertIn("from b", child_tools[1]["content"])
+            self.assertTrue(child_tools[2]["content"].startswith("Blocked by "))
+
+            child_agent.reset_session()
+
+            parent_agent.model = FakeProvider(
+                [
+                    ModelResponse(tool_calls=[ToolCall(id="p3", name="read_file", args={"path": str(file_a)})]),
+                    ModelResponse(content="parent turn 2 ok"),
+                ]
+            )
+            self.assertEqual(asyncio.run(parent_agent.run("parent reads a again")), "parent turn 2 ok")
+            parent_tools_t2 = [m for m in parent_agent.messages if m.get("role") == "tool"]
+            self.assertEqual(len(parent_tools_t2), 3)
+            self.assertTrue(parent_tools_t2[2]["content"].startswith("Blocked by "))
+            self.assertIn("loop detection", parent_tools_t2[2]["content"].lower())
 
 
 if __name__ == "__main__":
