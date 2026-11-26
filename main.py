@@ -20,7 +20,7 @@ from session import (
     restore_session_data as _restore_session_data,
     validate_session_id,
 )
-from tools import TOOLS, TOOL_SCHEMAS
+from tools import TOOL_SCHEMAS, build_tools
 
 
 __all__ = [
@@ -416,7 +416,7 @@ async def terminal_chat(
             "Mantenha o contexto das mensagens anteriores."
         ),
         guardrails=build_guardrails(guardrails_config),
-        tools=TOOLS,
+        tools=build_tools(),
         tool_schemas=TOOL_SCHEMAS,
         checkpointing=checkpointing,
         auto_approve=auto_approve,

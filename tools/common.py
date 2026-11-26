@@ -43,6 +43,17 @@ def _truncate(s: str, n: int = 25_000) -> str:
     return s if len(s) <= n else s[:n] + "\n[truncado]"
 
 
+def _resolve_tool_path(
+    path: str,
+    root_dir: str | pathlib.Path | None = None,
+) -> pathlib.Path:
+    """Resolve path relativo contra root_dir quando informado, ou contra o cwd atual."""
+    target = pathlib.Path(path)
+    if root_dir is None:
+        return target
+    return pathlib.Path(root_dir).resolve() / target
+
+
 def _is_link_or_junction(path: str) -> bool:
     if os.name == "nt":
         try:

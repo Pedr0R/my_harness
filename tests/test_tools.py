@@ -15,6 +15,7 @@ from tools import (
     TOOLS,
     TOOL_SCHEMAS,
     _truncate,
+    build_tools,
     tool_bash,
     tool_bash_async,
     tool_find_files,
@@ -578,6 +579,150 @@ class TestToolSpecsApprovalMetadata(unittest.TestCase):
         self.assertEqual(APPROVAL_REQUIRED_TOOLS, frozenset({"bash", "write_file", "search_replace"}))
         for schema in TOOL_SCHEMAS:
             self.assertEqual(set(schema.keys()), {"name", "description", "parameters"})
+
+
+class TestWorkspaceBoundTools(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        base = pathlib.Path(self._tmp.name).resolve()
+        self.root_a = base / "ws_a"
+        self.root_b = base / "ws_b"
+        self.root_a.mkdir()
+        self.root_b.mkdir()
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    @staticmethod
+    def _extract_bash_stdout(output: str) -> str:
+        after_stdout = output.split("stdout:\n", 1)[1]
+        return after_stdout.split("\nstderr:\n", 1)[0].strip()
+
+    def test_file_and_search_tools_resolve_relative_paths_against_root_dir_without_chdir(self) -> None:
+        cwd_before = pathlib.Path.cwd()
+
+        tool_write_file("sub/item.txt", "alpha_1\nalpha_2\n", root_dir=self.root_a)
+        tool_write_file("sub/item.txt", "beta_1\n", root_dir=self.root_b)
+        tool_write_file("only_a.txt", "a\n", root_dir=self.root_a)
+        tool_write_file("only_b.txt", "b\n", root_dir=self.root_b)
+
+        self.assertEqual(
+            (self.root_a / "sub" / "item.txt").read_text(encoding="utf-8"),
+            "alpha_1\nalpha_2\n",
+        )
+        self.assertEqual(
+            (self.root_b / "sub" / "item.txt").read_text(encoding="utf-8"),
+            "beta_1\n",
+        )
+
+        read_a = tool_read_file("sub/item.txt", root_dir=self.root_a)
+        read_b = tool_read_file("sub/item.txt", root_dir=self.root_b)
+        self.assertIn("alpha_1", read_a)
+        self.assertNotIn("beta_1", read_a)
+        self.assertIn("beta_1", read_b)
+        self.assertNotIn("alpha_1", read_b)
+
+        self.assertEqual(
+            tool_search_replace("sub/item.txt", "alpha_2", "alpha_updated", root_dir=self.root_a),
+            "OK",
+        )
+        self.assertEqual(
+            (self.root_b / "sub" / "item.txt").read_text(encoding="utf-8"),
+            "beta_1\n",
+        )
+
+        self.assertEqual(
+            tool_grep("alpha_updated", path=".", root_dir=self.root_a),
+            "sub/item.txt:2: alpha_updated",
+        )
+        self.assertEqual(
+            tool_grep("alpha_updated", path=".", root_dir=self.root_b),
+            "Nenhuma ocorrência encontrada.",
+        )
+        self.assertEqual(
+            tool_grep("beta_1", path="sub/item.txt", root_dir=self.root_b),
+            "sub/item.txt:1: beta_1",
+        )
+
+        list_a = tool_list_dir(".", max_depth=2, root_dir=self.root_a)
+        list_b = tool_list_dir(".", max_depth=2, root_dir=self.root_b)
+        self.assertIn("only_a.txt", list_a)
+        self.assertNotIn("only_b.txt", list_a)
+        self.assertIn("only_b.txt", list_b)
+        self.assertNotIn("only_a.txt", list_b)
+
+        self.assertEqual(
+            tool_find_files("*.txt", path=".", root_dir=self.root_a).splitlines(),
+            ["only_a.txt", "sub/item.txt"],
+        )
+        self.assertEqual(
+            tool_find_files("*.txt", path=".", root_dir=self.root_b).splitlines(),
+            ["only_b.txt", "sub/item.txt"],
+        )
+        self.assertEqual(pathlib.Path.cwd(), cwd_before)
+
+    def test_bash_and_bash_async_respect_explicit_cwd_without_chdir(self) -> None:
+        cwd_before = pathlib.Path.cwd()
+        cmd = f'"{sys.executable}" -c "import os; print(os.getcwd())"'
+
+        sync_out = tool_bash(cmd, cwd=self.root_a)
+        async_out = asyncio.run(tool_bash_async(cmd, cwd=self.root_b))
+
+        self.assertTrue(sync_out.startswith("exit=0\n"))
+        self.assertTrue(async_out.startswith("exit=0\n"))
+        self.assertEqual(
+            pathlib.Path(self._extract_bash_stdout(sync_out)).resolve(),
+            self.root_a,
+        )
+        self.assertEqual(
+            pathlib.Path(self._extract_bash_stdout(async_out)).resolve(),
+            self.root_b,
+        )
+        self.assertEqual(pathlib.Path.cwd(), cwd_before)
+
+    def test_build_tools_binds_all_native_tools_and_blocks_kwarg_injection(self) -> None:
+        tools_a = build_tools(self.root_a)
+        tools_b = build_tools(self.root_b)
+        tools_default = build_tools(None)
+
+        self.assertEqual(set(tools_a.keys()), set(TOOLS.keys()))
+        self.assertEqual(set(tools_b.keys()), set(TOOLS.keys()))
+        self.assertEqual(set(tools_default.keys()), set(TOOLS.keys()))
+        for schema in TOOL_SCHEMAS:
+            props = schema["parameters"]["properties"]
+            self.assertNotIn("root_dir", props)
+            self.assertNotIn("cwd", props)
+
+        tools_a["write_file"](path="note.txt", content="from_a_v1\n")
+        tools_b["write_file"](path="note.txt", content="from_b_v1\n")
+        self.assertIn("from_a_v1", tools_a["read_file"](path="note.txt"))
+        self.assertIn("from_b_v1", tools_b["read_file"](path="note.txt"))
+
+        self.assertEqual(
+            tools_a["search_replace"](path="note.txt", search="from_a_v1", replace="from_a_v2"),
+            "OK",
+        )
+        self.assertEqual(tools_a["grep"](pattern="from_a_v2", path="."), "note.txt:1: from_a_v2")
+        self.assertEqual(tools_a["list_dir"](path="."), "note.txt")
+        self.assertEqual(tools_a["find_files"](pattern="*.txt", path="."), "note.txt")
+
+        cmd = f'"{sys.executable}" -c "import os; print(os.getcwd())"'
+
+        async def run_bash_pair() -> tuple[str, str]:
+            return await asyncio.gather(tools_a["bash"](cmd), tools_b["bash"](cmd))
+
+        bash_a, bash_b = asyncio.run(run_bash_pair())
+        self.assertEqual(pathlib.Path(self._extract_bash_stdout(bash_a)).resolve(), self.root_a)
+        self.assertEqual(pathlib.Path(self._extract_bash_stdout(bash_b)).resolve(), self.root_b)
+
+        with self.assertRaises(TypeError):
+            tools_a["read_file"](path="note.txt", root_dir=str(self.root_b))
+        with self.assertRaises(TypeError):
+            tools_default["read_file"](path="note.txt", root_dir=str(self.root_b))
+        with self.assertRaises(TypeError):
+            asyncio.run(tools_a["bash"](cmd="echo ok", cwd=str(self.root_b)))
+        with self.assertRaises(TypeError):
+            asyncio.run(tools_default["bash"](cmd="echo ok", cwd=str(self.root_b)))
 
 
 if __name__ == "__main__":

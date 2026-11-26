@@ -2,28 +2,45 @@ from __future__ import annotations
 
 import pathlib
 
-from tools.common import ToolSpec, _truncate
+from tools.common import ToolSpec, _resolve_tool_path, _truncate
 
 
-def tool_read_file(path: str, offset: int = 0, limit: int = 2000) -> str:
+def tool_read_file(
+    path: str,
+    offset: int = 0,
+    limit: int = 2000,
+    *,
+    root_dir: str | pathlib.Path | None = None,
+) -> str:
     """Lê linhas de um arquivo com numeração e suporte a paginação."""
-    lines = pathlib.Path(path).read_text(encoding="utf-8", errors="replace").splitlines()
+    lines = _resolve_tool_path(path, root_dir).read_text(encoding="utf-8", errors="replace").splitlines()
     return _truncate(
         "\n".join(f"{i + 1:4}: {ln}" for i, ln in enumerate(lines[offset : offset + limit]))
     )
 
 
-def tool_write_file(path: str, content: str) -> str:
+def tool_write_file(
+    path: str,
+    content: str,
+    *,
+    root_dir: str | pathlib.Path | None = None,
+) -> str:
     """Escreve ou sobrescreve conteúdo em um arquivo."""
-    p = pathlib.Path(path)
+    p = _resolve_tool_path(path, root_dir)
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(content, encoding="utf-8")
     return f"escreveu {len(content)} bytes"
 
 
-def tool_search_replace(path: str, search: str, replace: str) -> str:
+def tool_search_replace(
+    path: str,
+    search: str,
+    replace: str,
+    *,
+    root_dir: str | pathlib.Path | None = None,
+) -> str:
     """Substitui uma ocorrência única de texto em um arquivo."""
-    p = pathlib.Path(path)
+    p = _resolve_tool_path(path, root_dir)
     text = p.read_text(encoding="utf-8", errors="replace")
 
     if text.count(search) != 1:
