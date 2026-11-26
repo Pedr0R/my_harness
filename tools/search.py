@@ -10,6 +10,7 @@ from tools.common import (
     ToolSpec,
     _filter_walk_dirs,
     _resolve_safe_walk_entry,
+    _resolve_tool_path,
     _truncate,
 )
 
@@ -50,6 +51,8 @@ def tool_grep(
     regex: bool = False,
     file_pattern: str = "*",
     max_results: int = 50,
+    *,
+    root_dir: str | pathlib.Path | None = None,
 ) -> str:
     """Busca texto literal ou regex em um arquivo ou recursivamente em um diretório."""
     if not pattern:
@@ -64,7 +67,7 @@ def tool_grep(
         except re.error as exc:
             return f"ERRO: expressão regular inválida: {exc}"
 
-    target = pathlib.Path(path)
+    target = _resolve_tool_path(path, root_dir)
     if not target.exists():
         return f"ERRO: caminho não encontrado: {path}"
 
@@ -72,7 +75,14 @@ def tool_grep(
     truncated = False
 
     if target.is_file():
-        truncated = _grep_file(target, target.as_posix(), pattern, compiled, matches, max_results)
+        truncated = _grep_file(
+            target,
+            pathlib.Path(path).as_posix(),
+            pattern,
+            compiled,
+            matches,
+            max_results,
+        )
     elif target.is_dir():
         search_root = target.resolve()
         for dirpath, dirnames, filenames in os.walk(search_root):
@@ -105,12 +115,17 @@ def tool_grep(
     return _truncate(output)
 
 
-def tool_list_dir(path: str = ".", max_depth: int = 1) -> str:
+def tool_list_dir(
+    path: str = ".",
+    max_depth: int = 1,
+    *,
+    root_dir: str | pathlib.Path | None = None,
+) -> str:
     """Lista arquivos e subdiretórios de forma hierárquica até max_depth níveis."""
     if max_depth <= 0:
         return "ERRO: max_depth deve ser maior que zero"
 
-    target = pathlib.Path(path)
+    target = _resolve_tool_path(path, root_dir)
     if not target.exists():
         return f"ERRO: caminho não encontrado: {path}"
     if not target.is_dir():
@@ -154,12 +169,17 @@ def tool_list_dir(path: str = ".", max_depth: int = 1) -> str:
     return _truncate("\n".join(lines))
 
 
-def tool_find_files(pattern: str = "*", path: str = ".") -> str:
+def tool_find_files(
+    pattern: str = "*",
+    path: str = ".",
+    *,
+    root_dir: str | pathlib.Path | None = None,
+) -> str:
     """Busca arquivos recursivamente em um diretório usando padrão glob."""
     if not pattern or not pattern.strip():
         return "ERRO: padrão de busca não pode ser vazio"
 
-    target = pathlib.Path(path)
+    target = _resolve_tool_path(path, root_dir)
     if not target.exists():
         return f"ERRO: caminho não encontrado: {path}"
     if not target.is_dir():

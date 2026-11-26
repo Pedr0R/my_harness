@@ -17,7 +17,7 @@ from guardrails import (
 )
 from providers import ModelProvider, ModelResponse, get_provider, stream_or_complete
 from session import load_session_file, save_session_file
-from tools import APPROVAL_REQUIRED_TOOLS, TOOLS, TOOL_SCHEMAS, _truncate
+from tools import APPROVAL_REQUIRED_TOOLS, TOOL_SCHEMAS, _truncate, build_tools
 from workspace import CheckpointResult, WorkspaceCheckpoint
 
 
@@ -142,7 +142,7 @@ class Agent:
     max_cost: float = 5.00
     compact_at_tokens: int = 120_000
     guardrails: list[BaseGuardrail] = field(default_factory=list)
-    tools: dict[str, Callable[..., Any]] = field(default_factory=lambda: dict(TOOLS))
+    tools: dict[str, Callable[..., Any]] | None = None
     tool_schemas: list[dict[str, Any]] = field(default_factory=lambda: list(TOOL_SCHEMAS))
     checkpointing: bool = False
     workspace_dir: str | pathlib.Path | None = None
@@ -151,6 +151,10 @@ class Agent:
     approval_callback: ApprovalCallback | None = None
     _checkpoints: list[WorkspaceCheckpoint] = field(default_factory=list, repr=False)
     last_rollback_message: str | None = field(default=None, repr=False)
+
+    def __post_init__(self) -> None:
+        if self.tools is None:
+            self.tools = build_tools(self.workspace_dir)
 
     def _record_checkpoint(self, checkpoint: WorkspaceCheckpoint) -> None:
         checkpoint.commit()
@@ -278,7 +282,7 @@ class Agent:
         if not allowed:
             raw_output: Any = blocked_message or "Blocked by safety rules."
         else:
-            fn = self.tools.get(call_name)
+            fn = self.tools.get(call_name) if self.tools is not None else None
             if not fn:
                 raw_output = f"ERRO: Ferramenta desconhecida '{call_name}'"
             else:
@@ -302,10 +306,17 @@ class Agent:
         self.last_rollback_message = None
 
         if not self.messages:
-            default_instructions = (
-                f"Você é um agente de engenharia de software conciso e prestativo.\n\n{discover_context()}"
-            )
-            system_content = self.instructions or default_instructions
+            if self.instructions:
+                system_content = self.instructions
+            else:
+                ctx = (
+                    discover_context(pathlib.Path(self.workspace_dir).resolve())
+                    if self.workspace_dir is not None
+                    else discover_context()
+                )
+                system_content = (
+                    f"Você é um agente de engenharia de software conciso e prestativo.\n\n{ctx}"
+                )
             self.messages.append({"role": "system", "content": system_content})
 
         self.messages.append({"role": "user", "content": task})

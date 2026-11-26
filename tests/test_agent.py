@@ -25,7 +25,14 @@ from agent import (
     EventType,
     discover_context,
 )
-from guardrails import CommandSafetyGuardrail, PathSandboxingGuardrail, SecretsRedactionGuardrail
+from guardrails import (
+    CommandSafetyGuardrail,
+    GuardrailsConfig,
+    PathSandboxingGuardrail,
+    SecretsRedactionGuardrail,
+    build_guardrails,
+    clone_guardrails,
+)
 from guardrails.base import BaseGuardrail, GuardrailResult
 import main
 from providers.base import ModelResponse, StreamChunk, ToolCall
@@ -1505,6 +1512,181 @@ class TestAsyncToolExecution(unittest.TestCase):
         tool_msgs = [m for m in agent.messages if m["role"] == "tool"]
         self.assertEqual(len(tool_msgs), 1)
         self.assertIn("default_bash_async_ok", tool_msgs[0]["content"])
+
+
+class TestAgentWorkspaceIsolation(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        base = pathlib.Path(self._tmp.name).resolve()
+        self.ws_a = base / "ws_a"
+        self.ws_b = base / "ws_b"
+        self.ws_a.mkdir()
+        self.ws_b.mkdir()
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    @staticmethod
+    def _extract_bash_stdout(output: str) -> str:
+        after_stdout = output.split("stdout:\n", 1)[1]
+        return after_stdout.split("\nstderr:\n", 1)[0].strip()
+
+    def test_two_agents_with_distinct_workspace_dirs_run_concurrently_without_chdir(self) -> None:
+        cwd_before = pathlib.Path.cwd()
+        (self.ws_a / "AGENTS.md").write_text("RULES_WS_A", encoding="utf-8")
+        (self.ws_b / "AGENTS.md").write_text("RULES_WS_B", encoding="utf-8")
+        (self.ws_a / "data.txt").write_text("VAL=A0\n", encoding="utf-8")
+        (self.ws_b / "data.txt").write_text("VAL=B0\n", encoding="utf-8")
+
+        cmd = f'"{sys.executable}" -c "import os; print(os.getcwd())"'
+
+        def build_steps(label: str) -> list[ModelResponse]:
+            return [
+                ModelResponse(tool_calls=[ToolCall(id=f"{label}1", name="read_file", args={"path": "data.txt"})]),
+                ModelResponse(
+                    tool_calls=[
+                        ToolCall(
+                            id=f"{label}2",
+                            name="search_replace",
+                            args={"path": "data.txt", "search": f"VAL={label}0", "replace": f"VAL={label}1"},
+                        )
+                    ]
+                ),
+                ModelResponse(
+                    tool_calls=[
+                        ToolCall(
+                            id=f"{label}3",
+                            name="write_file",
+                            args={"path": "notes/out.txt", "content": f"OUT_{label}\n"},
+                        )
+                    ]
+                ),
+                ModelResponse(
+                    tool_calls=[ToolCall(id=f"{label}4", name="grep", args={"pattern": "VAL=", "path": "."})]
+                ),
+                ModelResponse(tool_calls=[ToolCall(id=f"{label}5", name="list_dir", args={"path": "."})]),
+                ModelResponse(
+                    tool_calls=[ToolCall(id=f"{label}6", name="find_files", args={"pattern": "*.txt", "path": "."})]
+                ),
+                ModelResponse(tool_calls=[ToolCall(id=f"{label}7", name="bash", args={"cmd": cmd})]),
+                ModelResponse(content=f"done_{label}"),
+            ]
+
+        guardrails_a = build_guardrails(GuardrailsConfig(root_dir=self.ws_a))
+        guardrails_b = clone_guardrails(guardrails_a, root_dir=self.ws_b)
+
+        agent_a = Agent(
+            name="AgentA",
+            model=FakeProvider(build_steps("A")),
+            workspace_dir=self.ws_a,
+            guardrails=guardrails_a,
+        )
+        agent_b = Agent(
+            name="AgentB",
+            model=FakeProvider(build_steps("B")),
+            workspace_dir=self.ws_b,
+            guardrails=guardrails_b,
+        )
+
+        async def run_both() -> tuple[str, str]:
+            return await asyncio.gather(agent_a.run("task a"), agent_b.run("task b"))
+
+        res_a, res_b = asyncio.run(run_both())
+        self.assertEqual(res_a, "done_A")
+        self.assertEqual(res_b, "done_B")
+
+        self.assertEqual((self.ws_a / "data.txt").read_text(encoding="utf-8"), "VAL=A1\n")
+        self.assertEqual((self.ws_b / "data.txt").read_text(encoding="utf-8"), "VAL=B1\n")
+        self.assertEqual((self.ws_a / "notes" / "out.txt").read_text(encoding="utf-8"), "OUT_A\n")
+        self.assertEqual((self.ws_b / "notes" / "out.txt").read_text(encoding="utf-8"), "OUT_B\n")
+
+        sys_a = agent_a.messages[0]["content"]
+        sys_b = agent_b.messages[0]["content"]
+        self.assertIn("RULES_WS_A", sys_a)
+        self.assertNotIn("RULES_WS_B", sys_a)
+        self.assertIn("RULES_WS_B", sys_b)
+        self.assertNotIn("RULES_WS_A", sys_b)
+
+        tools_a = [m["content"] for m in agent_a.messages if m["role"] == "tool"]
+        tools_b = [m["content"] for m in agent_b.messages if m["role"] == "tool"]
+        self.assertEqual(len(tools_a), 7)
+        self.assertEqual(len(tools_b), 7)
+
+        self.assertIn("VAL=A0", tools_a[0])
+        self.assertIn("VAL=B0", tools_b[0])
+        self.assertEqual(tools_a[1], "OK")
+        self.assertEqual(tools_b[1], "OK")
+        self.assertIn("VAL=A1", tools_a[3])
+        self.assertNotIn("VAL=B", tools_a[3])
+        self.assertIn("VAL=B1", tools_b[3])
+        self.assertNotIn("VAL=A", tools_b[3])
+        self.assertIn("notes/", tools_a[4])
+        self.assertIn("notes/", tools_b[4])
+        self.assertEqual(tools_a[5].splitlines(), ["data.txt", "notes/out.txt"])
+        self.assertEqual(tools_b[5].splitlines(), ["data.txt", "notes/out.txt"])
+        self.assertEqual(pathlib.Path(self._extract_bash_stdout(tools_a[6])).resolve(), self.ws_a)
+        self.assertEqual(pathlib.Path(self._extract_bash_stdout(tools_b[6])).resolve(), self.ws_b)
+        self.assertEqual(pathlib.Path.cwd(), cwd_before)
+
+    def test_agent_blocks_llm_injected_root_dir_and_cwd_and_preserves_custom_tools(self) -> None:
+        (self.ws_b / "secret.txt").write_text("TOP_SECRET", encoding="utf-8")
+
+        for ws in (self.ws_a, None):
+            with self.subTest(workspace_dir=ws):
+                agent = Agent(
+                    model=FakeProvider(
+                        [
+                            ModelResponse(
+                                tool_calls=[
+                                    ToolCall(
+                                        id="c_read",
+                                        name="read_file",
+                                        args={"path": "secret.txt", "root_dir": str(self.ws_b)},
+                                    ),
+                                    ToolCall(
+                                        id="c_bash",
+                                        name="bash",
+                                        args={"cmd": "echo leaked", "cwd": str(self.ws_b)},
+                                    ),
+                                ]
+                            ),
+                            ModelResponse(content="blocked"),
+                        ]
+                    ),
+                    instructions="sys",
+                    workspace_dir=ws,
+                )
+                reply = asyncio.run(agent.run("attempt kwarg injection"))
+                self.assertEqual(reply, "blocked")
+                tool_msgs = [m["content"] for m in agent.messages if m["role"] == "tool"]
+                self.assertEqual(len(tool_msgs), 2)
+                for msg in tool_msgs:
+                    self.assertTrue(msg.startswith("ERRO: TypeError:"))
+                    self.assertNotIn("TOP_SECRET", msg)
+                    self.assertNotIn("leaked", msg)
+
+        custom_agent = Agent(
+            model=FakeProvider(
+                [
+                    ModelResponse(tool_calls=[ToolCall(id="p1", name="ping", args={})]),
+                    ModelResponse(content="ponged"),
+                ]
+            ),
+            instructions="sys",
+            workspace_dir=self.ws_a,
+            tools={"ping": lambda: "pong"},
+            tool_schemas=[
+                {
+                    "name": "ping",
+                    "description": "ping",
+                    "parameters": {"type": "object", "properties": {}},
+                }
+            ],
+        )
+        self.assertEqual(set(custom_agent.tools.keys()), {"ping"})
+        self.assertEqual(asyncio.run(custom_agent.run("ping")), "ponged")
+        custom_tools = [m["content"] for m in custom_agent.messages if m["role"] == "tool"]
+        self.assertEqual(custom_tools, ["pong"])
 
 
 if __name__ == "__main__":
