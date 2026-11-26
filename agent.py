@@ -289,6 +289,8 @@ class Agent:
                 else:
                     try:
                         raw_output = fn(**effective_args)
+                        if inspect.isawaitable(raw_output):
+                            raw_output = await raw_output
                     except Exception as exc:
                         raw_output = f"ERRO: {type(exc).__name__}: {exc}"
 

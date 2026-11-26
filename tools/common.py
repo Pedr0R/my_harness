@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 import os
 import pathlib
 import stat
-from typing import Any, Callable
+from typing import Any
 
 from workspace import is_sensitive_path
+
+
+ToolHandler = Callable[..., str | Awaitable[str]]
 
 
 IGNORED_DIRS: frozenset[str] = frozenset(
@@ -21,7 +25,7 @@ class ToolSpec:
     name: str
     description: str
     parameters: dict[str, Any]
-    handler: Callable[..., str]
+    handler: ToolHandler
     checks_path: bool = False
     default_path: str | None = None
     requires_approval: bool = False

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import os
 import pathlib
 import subprocess
@@ -11,9 +12,11 @@ import unittest
 from agent import discover_context
 from tools import (
     APPROVAL_REQUIRED_TOOLS,
+    TOOLS,
     TOOL_SCHEMAS,
     _truncate,
     tool_bash,
+    tool_bash_async,
     tool_find_files,
     tool_grep,
     tool_list_dir,
@@ -511,6 +514,34 @@ class TestToolBash(unittest.TestCase):
         cmd = f'"{sys.executable}" -c "import sys; sys.exit(7)"'
         out = tool_bash(cmd)
         self.assertTrue(out.startswith("exit=7\n"))
+
+    def test_tool_bash_async_does_not_block_concurrent_event_loop_tasks(self) -> None:
+        self.assertIs(TOOLS["bash"], tool_bash_async)
+        cmd = f'"{sys.executable}" -c "import time; time.sleep(0.25); print(\'async_done\')"'
+
+        async def run_concurrently() -> tuple[str, int]:
+            done = asyncio.Event()
+            ticks = 0
+
+            async def ticker() -> None:
+                nonlocal ticks
+                while not done.is_set():
+                    ticks += 1
+                    await asyncio.sleep(0.02)
+
+            async def run_shell() -> str:
+                try:
+                    return await tool_bash_async(cmd)
+                finally:
+                    done.set()
+
+            out, _ = await asyncio.gather(run_shell(), ticker())
+            return out, ticks
+
+        out, ticks = asyncio.run(run_concurrently())
+        self.assertTrue(out.startswith("exit=0\n"))
+        self.assertIn("async_done", out)
+        self.assertGreaterEqual(ticks, 3)
 
 
 class TestDiscoverContext(unittest.TestCase):
