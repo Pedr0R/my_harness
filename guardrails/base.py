@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass
+import pathlib
 from typing import Any
 
 
@@ -25,6 +27,12 @@ class BaseGuardrail:
 
     def reset(self) -> None:
         return None
+
+    def clone(self, *, root_dir: str | pathlib.Path | None = None) -> BaseGuardrail:
+        del root_dir
+        cloned = copy.deepcopy(self)
+        cloned.reset()
+        return cloned
 
 
 def _format_blocked_reason(reason: str | None) -> str:
@@ -69,3 +77,20 @@ def reset_guardrails(guardrails: list[BaseGuardrail]) -> None:
     for guardrail in guardrails:
         if hasattr(guardrail, "reset"):
             guardrail.reset()
+
+
+def clone_guardrails(
+    guardrails: list[BaseGuardrail],
+    *,
+    root_dir: str | pathlib.Path | None = None,
+) -> list[BaseGuardrail]:
+    cloned: list[BaseGuardrail] = []
+    for guardrail in guardrails:
+        if hasattr(guardrail, "clone"):
+            cloned.append(guardrail.clone(root_dir=root_dir))
+        else:
+            item = copy.deepcopy(guardrail)
+            if hasattr(item, "reset"):
+                item.reset()
+            cloned.append(item)
+    return cloned

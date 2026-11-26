@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import pathlib
 import re
 from typing import Any
 
@@ -124,3 +125,11 @@ class CommandSafetyGuardrail(BaseGuardrail):
                 )
 
         return GuardrailResult(allowed=True)
+
+    def clone(
+        self,
+        *,
+        root_dir: str | pathlib.Path | None = None,
+    ) -> CommandSafetyGuardrail:
+        del root_dir
+        return CommandSafetyGuardrail(enabled=self.enabled)

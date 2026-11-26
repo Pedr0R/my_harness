@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import pathlib
 import re
 
 from guardrails.base import BaseGuardrail
@@ -65,3 +66,14 @@ class SecretsRedactionGuardrail(BaseGuardrail):
             redacted,
         )
         return redacted
+
+    def clone(
+        self,
+        *,
+        root_dir: str | pathlib.Path | None = None,
+    ) -> SecretsRedactionGuardrail:
+        del root_dir
+        return SecretsRedactionGuardrail(
+            replacement=self.replacement,
+            enabled=self.enabled,
+        )

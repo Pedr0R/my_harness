@@ -1,6 +1,7 @@
 from guardrails.base import (
     BaseGuardrail,
     GuardrailResult,
+    clone_guardrails,
     reset_guardrails,
     run_guardrail_checks,
     sanitize_with_guardrails,
@@ -20,6 +21,7 @@ __all__ = [
     "LoopDetectionGuardrail",
     "GuardrailsConfig",
     "build_guardrails",
+    "clone_guardrails",
     "reset_guardrails",
     "run_guardrail_checks",
     "sanitize_with_guardrails",
