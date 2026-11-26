@@ -8,6 +8,7 @@ import json
 import os
 import pathlib
 import subprocess
+import sys
 import tempfile
 import unittest
 from typing import Any
@@ -24,7 +25,7 @@ from agent import (
     EventType,
     discover_context,
 )
-from guardrails import CommandSafetyGuardrail, PathSandboxingGuardrail
+from guardrails import CommandSafetyGuardrail, PathSandboxingGuardrail, SecretsRedactionGuardrail
 from guardrails.base import BaseGuardrail, GuardrailResult
 import main
 from providers.base import ModelResponse, StreamChunk, ToolCall
@@ -1314,6 +1315,196 @@ class TestTerminalStreamRenderer(unittest.TestCase):
         renderer.finish_on_interrupt()
 
         self.assertEqual(buf.getvalue(), "\nAgente: Parcial\n")
+
+
+class TestAsyncToolExecution(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = pathlib.Path(self._tmp.name).resolve()
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def test_async_tool_executes_sanitizes_secrets_and_feeds_result_back_to_model(self) -> None:
+        seen_inputs: list[str] = []
+
+        async def async_fetch(query: str) -> str:
+            await asyncio.sleep(0)
+            seen_inputs.append(query)
+            return "GEMINI_API_KEY=AIzaSyFakeAsyncSecretKey1234567890abcd\nstatus=ok"
+
+        custom_schemas = [
+            {
+                "name": "async_fetch",
+                "description": "Async fetch tool",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"query": {"type": "string"}},
+                    "required": ["query"],
+                },
+            }
+        ]
+        provider = FakeProvider(
+            [
+                ModelResponse(tool_calls=[ToolCall(id="c_async", name="async_fetch", args={"query": "cfg"})]),
+                ModelResponse(content="Segredo protegido."),
+            ]
+        )
+        agent = Agent(
+            model=provider,
+            instructions="sys",
+            guardrails=[SecretsRedactionGuardrail()],
+            tools={"async_fetch": async_fetch},
+            tool_schemas=custom_schemas,
+        )
+
+        reply = asyncio.run(agent.run("fetch config"))
+        self.assertEqual(reply, "Segredo protegido.")
+        self.assertEqual(seen_inputs, ["cfg"])
+
+        second_turn_messages = provider.calls[1][0]
+        tool_msg = second_turn_messages[-1]
+        self.assertEqual(tool_msg["role"], "tool")
+        self.assertEqual(tool_msg["tool_call_id"], "c_async")
+        self.assertIn("[REDACTED]", tool_msg["content"])
+        self.assertIn("status=ok", tool_msg["content"])
+        self.assertNotIn("AIzaSyFakeAsyncSecretKey", tool_msg["content"])
+
+    def test_async_tool_exception_returns_error_message_without_crashing(self) -> None:
+        async def failing_async() -> str:
+            await asyncio.sleep(0)
+            raise ValueError("async boom")
+
+        custom_schemas = [
+            {
+                "name": "failing_async",
+                "description": "Failing async tool",
+                "parameters": {"type": "object", "properties": {}},
+            }
+        ]
+        provider = FakeProvider(
+            [
+                ModelResponse(tool_calls=[ToolCall(id="c_fail", name="failing_async", args={})]),
+                ModelResponse(content="Recuperado."),
+            ]
+        )
+        agent = Agent(
+            model=provider,
+            instructions="sys",
+            tools={"failing_async": failing_async},
+            tool_schemas=custom_schemas,
+        )
+
+        reply = asyncio.run(agent.run("trigger async error"))
+        self.assertEqual(reply, "Recuperado.")
+        tool_msgs = [m for m in agent.messages if m["role"] == "tool"]
+        self.assertEqual(len(tool_msgs), 1)
+        self.assertEqual(tool_msgs[0]["content"], "ERRO: ValueError: async boom")
+
+    def test_async_tool_blocked_by_hitl_is_never_invoked(self) -> None:
+        calls = 0
+
+        async def guarded_async() -> str:
+            nonlocal calls
+            calls += 1
+            return "executed"
+
+        custom_schemas = [
+            {
+                "name": "guarded_async",
+                "description": "Guarded async tool",
+                "parameters": {"type": "object", "properties": {}},
+            }
+        ]
+        provider = FakeProvider(
+            [
+                ModelResponse(tool_calls=[ToolCall(id="c_hitl", name="guarded_async", args={})]),
+                ModelResponse(content="Recusado."),
+            ]
+        )
+        agent = Agent(
+            model=provider,
+            instructions="sys",
+            tools={"guarded_async": guarded_async},
+            tool_schemas=custom_schemas,
+            auto_approve=False,
+            require_approval={"guarded_async"},
+            approval_callback=lambda _name, _args: False,
+        )
+
+        reply = asyncio.run(agent.run("run guarded"))
+        self.assertEqual(reply, "Recusado.")
+        self.assertEqual(calls, 0)
+        tool_msgs = [m for m in agent.messages if m["role"] == "tool"]
+        self.assertIn("recusada", tool_msgs[0]["content"].lower())
+
+    def test_async_tool_cancellation_propagates_and_triggers_workspace_rollback(self) -> None:
+        repo = self.root / "repo"
+        repo.mkdir()
+        subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True)
+        subprocess.run(["git", "config", "user.name", "Test User"], cwd=repo, check=True)
+        app_file = repo / "app.py"
+        app_file.write_text("VALUE = 1\n", encoding="utf-8")
+        subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
+        subprocess.run(["git", "commit", "-m", "initial"], cwd=repo, check=True, capture_output=True)
+
+        async def cancel_tool() -> str:
+            await asyncio.sleep(0)
+            raise asyncio.CancelledError
+
+        from tools import TOOLS, TOOL_SCHEMAS
+
+        tools = dict(TOOLS)
+        tools["cancel_tool"] = cancel_tool
+        schemas = list(TOOL_SCHEMAS) + [
+            {
+                "name": "cancel_tool",
+                "description": "Cancels execution",
+                "parameters": {"type": "object", "properties": {}},
+            }
+        ]
+        provider = FakeProvider(
+            [
+                ModelResponse(
+                    tool_calls=[
+                        ToolCall(id="c1", name="write_file", args={"path": str(app_file), "content": "VALUE = 2\n"}),
+                        ToolCall(id="c2", name="cancel_tool", args={}),
+                    ]
+                )
+            ]
+        )
+        agent = Agent(
+            model=provider,
+            instructions="sys",
+            tools=tools,
+            tool_schemas=schemas,
+            checkpointing=True,
+            workspace_dir=repo,
+        )
+
+        with self.assertRaises(asyncio.CancelledError):
+            asyncio.run(agent.run("edit then cancel"))
+
+        self.assertEqual(app_file.read_text(encoding="utf-8"), "VALUE = 1\n")
+        self.assertIsNotNone(agent.last_rollback_message)
+        self.assertIn("Workspace restaurado", agent.last_rollback_message or "")
+
+    def test_agent_runs_default_bash_tool_via_async_handler(self) -> None:
+        cmd = f'"{sys.executable}" -c "print(\'default_bash_async_ok\')"'
+        provider = FakeProvider(
+            [
+                ModelResponse(tool_calls=[ToolCall(id="c_bash", name="bash", args={"cmd": cmd})]),
+                ModelResponse(content="Concluído."),
+            ]
+        )
+        agent = Agent(model=provider, instructions="sys")
+
+        reply = asyncio.run(agent.run("run bash"))
+        self.assertEqual(reply, "Concluído.")
+        tool_msgs = [m for m in agent.messages if m["role"] == "tool"]
+        self.assertEqual(len(tool_msgs), 1)
+        self.assertIn("default_bash_async_ok", tool_msgs[0]["content"])
 
 
 if __name__ == "__main__":

@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-from typing import Any, Callable
+from typing import Any
 
-from tools.common import IGNORED_DIRS, ToolSpec, _truncate
+from tools.common import IGNORED_DIRS, ToolHandler, ToolSpec, _truncate
 from tools.files import FILE_TOOL_SPECS, tool_read_file, tool_search_replace, tool_write_file
 from tools.search import SEARCH_TOOL_SPECS, tool_find_files, tool_grep, tool_list_dir
-from tools.shell import BASH_SPEC, tool_bash
+from tools.shell import BASH_SPEC, tool_bash, tool_bash_async
 
 ALL_TOOL_SPECS: tuple[ToolSpec, ...] = (
     BASH_SPEC,
@@ -13,7 +13,7 @@ ALL_TOOL_SPECS: tuple[ToolSpec, ...] = (
     *SEARCH_TOOL_SPECS,
 )
 
-TOOLS: dict[str, Callable[..., str]] = {spec.name: spec.handler for spec in ALL_TOOL_SPECS}
+TOOLS: dict[str, ToolHandler] = {spec.name: spec.handler for spec in ALL_TOOL_SPECS}
 TOOL_SCHEMAS: list[dict[str, Any]] = [spec.to_schema() for spec in ALL_TOOL_SPECS]
 FILE_TOOLS: frozenset[str] = frozenset(spec.name for spec in ALL_TOOL_SPECS if spec.checks_path)
 DEFAULT_PATH_TOOLS: frozenset[str] = frozenset(
@@ -31,9 +31,11 @@ __all__ = [
     "IGNORED_DIRS",
     "TOOLS",
     "TOOL_SCHEMAS",
+    "ToolHandler",
     "ToolSpec",
     "_truncate",
     "tool_bash",
+    "tool_bash_async",
     "tool_find_files",
     "tool_grep",
     "tool_list_dir",
